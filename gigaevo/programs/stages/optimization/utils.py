@@ -248,18 +248,14 @@ async def evaluate_single(
         logger.trace("[{}] single evaluation timed out", log_tag)
         return None, "Timeout"
     except ExecRunnerError as exc:
-        # exc.stderr may carry ANSI / NUL / BIDI from heterogeneous
-        # compiler stacks; the str(exc) message is sanitized too because
-        # ExecRunnerError stores arbitrary text.
-        last_line = (exc.stderr or "").strip().rsplit("\n", 1)[-1]
+        # Keep the full stderr (#15 ER2 — earlier ``rsplit("\n", 1)[-1]`` dropped
+        # the traceback) and sanitise the text (#10) — heterogeneous compiler
+        # stacks emit ANSI / NUL / BIDI that we don't want re-injected into
+        # log sinks.
+        stderr_tail = (exc.stderr or "").strip()
         safe_exc = sanitize_for_log(str(exc))
-        safe_last = sanitize_for_log(last_line)
+        safe_tail = sanitize_for_log(stderr_tail)
         logger.trace(
-            "[{}] eval failed: {} | {}",
-            log_tag,
-            safe_exc,
-            safe_last,
+            "[{}] eval failed: {} | {}", log_tag, safe_exc, safe_tail
         )
-        # Return the sanitized error message so callers can log / store
-        # it without re-introducing terminal control bytes.
-        return None, f"{safe_exc} | {safe_last}"
+        return None, f"{safe_exc} | {safe_tail}" if safe_tail else safe_exc

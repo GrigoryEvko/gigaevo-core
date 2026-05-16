@@ -74,19 +74,18 @@ class ValidateCodeStage(Stage):
         try:
             compile(code, "<string>", "exec")
         except SyntaxError as e:
-            # ``e.msg`` and ``e.text`` come from the parser operating on
-            # LLM output, which can embed control bytes that would slip
-            # into the re-raised exception's args and from there into
-            # every downstream log / serialization path. Sanitize before
-            # interpolation; the StageError validators below would catch
-            # the final log line, but the exception text itself is
-            # consumed elsewhere (e.g. ``__cause__`` chains in tests).
-            code_line = (e.text or "").strip() or "<source unavailable>"
-            raise SyntaxError(
-                f"SyntaxError at line {e.lineno}, offset {e.offset}: "
-                f"{sanitize_for_log(e.msg or '')}. "
-                f"Line: `{sanitize_for_log(code_line)}`"
-            ) from e
+            # Reconstruct a SyntaxError preserving msg/filename/lineno/offset/text
+            # (#15 ER7) so downstream ``traceback.format_exception`` retains the
+            # location pointer.  ``e.msg`` is sanitised (#10) — parser output
+            # over LLM-generated code can carry control bytes; ``e.text`` is
+            # left raw so caret-pointer arithmetic against ``e.offset`` stays
+            # accurate.
+            new_err = SyntaxError(
+                sanitize_for_log(e.msg or "syntax error"),
+                (e.filename, e.lineno, e.offset, e.text),
+            )
+            raise new_err from e
+>>>>>>> origin/fix/error-context-preservation
 
         if self.safe_mode:
             self._validate_security_text(code)

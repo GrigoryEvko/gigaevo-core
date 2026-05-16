@@ -590,16 +590,15 @@ class OptunaOptimizationStage(Stage):
         except TimeoutError:
             return None, None, "Timeout"
         except ExecRunnerError as exc:
-            # Sanitize compiler-stderr-derived text before it flows into
-            # StageError.message / loguru sinks downstream. The returned
-            # error string ends up in failure_reasons and ultimately in
-            # log lines aggregated for the LLM.
-            last_line = (exc.stderr or "").strip().rsplit("\n", 1)[-1]
-            return (
-                None,
-                None,
-                f"{sanitize_for_log(str(exc))} | {sanitize_for_log(last_line)}",
-            )
+            # Keep the full stderr (#15 ER2) and sanitise the text (#10) — the
+            # returned detail flows into ``failure_reasons`` and ultimately
+            # into LLM-facing prompts, so compiler control bytes from nvcc /
+            # ptxas / Triton must be inert before interpolation.
+            stderr_tail = (exc.stderr or "").strip()
+            safe_exc = sanitize_for_log(str(exc))
+            safe_tail = sanitize_for_log(stderr_tail)
+            detail = f"{safe_exc} | {safe_tail}" if safe_tail else safe_exc
+            return None, None, detail
 
     async def _run_optuna(
         self,
