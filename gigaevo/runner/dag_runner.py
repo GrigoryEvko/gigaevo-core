@@ -20,7 +20,10 @@ from gigaevo.programs.program import Program
 from gigaevo.programs.program_state import ProgramState
 from gigaevo.runner.dag_blueprint import DAGBlueprint
 from gigaevo.utils.metrics_collector import start_metrics_collector
+from gigaevo.utils.text_sanitize import sanitize_for_log
 from gigaevo.utils.trackers.base import LogWriter
+
+__all__ = ["sanitize_for_log"]
 
 if TYPE_CHECKING:
     from gigaevo.dataplane import DataPlane, EngineRoot
