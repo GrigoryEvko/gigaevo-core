@@ -85,7 +85,6 @@ class ValidateCodeStage(Stage):
                 (e.filename, e.lineno, e.offset, e.text),
             )
             raise new_err from e
->>>>>>> origin/fix/error-context-preservation
 
         if self.safe_mode:
             self._validate_security_text(code)
