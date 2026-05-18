@@ -257,19 +257,21 @@ class TestRedisPromptStatsProviderErrorLog:
             host="localhost", port=6379, db=0, prefix="test"
         )
 
-        # Make the Redis client GET raise with hostile error text.
-        class BoomRedis:
-            async def get(self, _key: str) -> None:
-                raise RuntimeError(f"redis error: {HOSTILE}")
+        # ``_get_dataplane`` wraps the lazy DataPlane handle construction.
+        # Raise with hostile bytes from there so the read-boundary
+        # ``logger.warning`` in ``get_stats`` fires through
+        # ``sanitize_for_log`` on both ``prompt_id`` and the exception.
+        async def boom(_idx: int) -> None:
+            raise RuntimeError(f"redis error: {HOSTILE}")
 
-        monkeypatch.setattr(provider, "_get_redis", lambda _db: BoomRedis())
+        monkeypatch.setattr(provider, "_get_dataplane", boom)
 
-        # Prompt ID with hostile bytes too (rare but possible in tests).
         result = await provider.get_stats(prompt_id=f"pid-{HOSTILE}")
-        # No data found -> default zero stats.
+        # All sources failed -> default zero stats.
         assert result.trials == 0
         captured = loguru_sink.getvalue()
-        assert "Error reading stats from" in captured
+        assert "DataPlane[" in captured
+        assert "startup failed" in captured
         _assert_sanitized(captured)
 
 
@@ -294,15 +296,19 @@ class TestGigaEvoArchivePromptFetcherLogs:
     ) -> None:
         fetcher = self._make_fetcher(tmp_path)
 
-        class BoomRedis:
-            def hvals(self, _k: str) -> None:
+        # ``_refresh_candidates_async`` reaches the archive through
+        # ``self._prompt_dp.raw_hash_values``. Wire a fake DataPlane
+        # whose async method raises with hostile bytes so the
+        # boundary ``logger.warning`` fires through ``sanitize_for_log``.
+        class BoomDataPlane:
+            async def raw_hash_values(self, _key: str) -> None:
                 raise RuntimeError(f"hvals failed: {HOSTILE}")
 
-        monkeypatch.setattr(fetcher, "_get_sync_redis", lambda: BoomRedis())
+        monkeypatch.setattr(fetcher, "_prompt_dp", BoomDataPlane())
         result = fetcher._refresh_candidates()
         assert result is None
         captured = loguru_sink.getvalue()
-        assert "Archive read error" in captured
+        assert "Archive hvals error" in captured
         _assert_sanitized(captured)
 
     def test_entrypoint_execution_error_log_sanitized(
@@ -343,15 +349,20 @@ class TestGigaEvoArchivePromptFetcherLogs:
     ) -> None:
         fetcher = self._make_fetcher(tmp_path)
 
-        class FakeRedis:
-            def hvals(self, _k: str) -> list[str]:
-                return [f"prog-{HOSTILE}"]
+        # ``_refresh_candidates_async`` lists program ids via
+        # ``raw_hash_values`` then fetches each entry via ``raw_get``.
+        # Returning non-JSON bytes triggers the per-entry ``except`` that
+        # wraps ``json.loads(...)``, which logs through ``sanitize_for_log``.
+        from gigaevo.dataplane import Ok
 
-            def get(self, _k: str) -> str:
-                # Not valid JSON -> triggers the inner except branch.
-                return f"not-json {HOSTILE}"
+        class FakeDataPlane:
+            async def raw_hash_values(self, _key: str):
+                return Ok([f"prog-{HOSTILE}"])
 
-        monkeypatch.setattr(fetcher, "_get_sync_redis", lambda: FakeRedis())
+            async def raw_get(self, _key: str):
+                return Ok(f"not-json {HOSTILE}")
+
+        monkeypatch.setattr(fetcher, "_prompt_dp", FakeDataPlane())
         out = fetcher._refresh_candidates()
         # No valid candidates produced; return is None.
         assert out is None

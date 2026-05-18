@@ -129,26 +129,16 @@ class TestModelRouterLogSanitization:
         self, loguru_sink, monkeypatch
     ) -> None:
         """Server-returned model ids with hostile bytes are sanitized in WARN."""
-        import urllib.request
+        import gigaevo.llm.models as models_mod
 
-        class FakeResp:
-            def __enter__(self):
-                return self
+        # ``_fetch_available_models_at`` is the helper the router calls to
+        # discover what each endpoint advertises. Stub it so the test does
+        # not need to wait on a real HTTP request, returning an id with
+        # hostile bytes so the NOT-FOUND log goes through ``sanitize_for_log``.
+        def fake_fetch(_base_url: str, _api_key: str):
+            return frozenset({f"other-model{HOSTILE}"})
 
-            def __exit__(self, *exc):
-                return False
-
-            def read(self):
-                # The server claims to host a different model than the
-                # configured one, with hostile bytes in its id.
-                return json.dumps(
-                    {"data": [{"id": f"other-model{HOSTILE}"}]}
-                ).encode("utf-8")
-
-        def fake_urlopen(*_a, **_kw):
-            return FakeResp()
-
-        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+        monkeypatch.setattr(models_mod, "_fetch_available_models_at", fake_fetch)
         models = [_mock_model("gpt-4")]
         models[0].base_url = "http://host:8000/v1"
         MultiModelRouter(models, [1.0], writer=NullWriter(), name="probe2")
@@ -460,5 +450,8 @@ class TestBanditRouterLogSanitization:
             outcome=MutationOutcome.REJECTED_ACCEPTOR,
         )
         captured = loguru_sink.getvalue()
-        assert "Reward for" in captured
+        # An unknown-arm key short-circuits at ``Skipping reward for ...``
+        # before reaching ``update_reward``; the hostile arm name must
+        # appear sanitized in that log.
+        assert "reward for" in captured.lower()
         _assert_no_raw_hostile(captured)

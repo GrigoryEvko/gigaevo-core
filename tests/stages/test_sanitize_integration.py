@@ -353,7 +353,6 @@ class TestEvaluateSingleSanitization:
                 score_key="score",
                 python_path=[],
                 timeout=5,
-                max_memory_mb=None,
                 log_tag="Unit",
             )
             assert scores is None
