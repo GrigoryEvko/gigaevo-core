@@ -36,9 +36,11 @@ def _clean_cache():
 
     with models_mod._verify_cache_lock:
         models_mod._verify_cache.clear()
+        models_mod._verify_failure_counts.clear()
     yield
     with models_mod._verify_cache_lock:
         models_mod._verify_cache.clear()
+        models_mod._verify_failure_counts.clear()
 
 
 class TestFetchAvailableModelsAt:
@@ -153,6 +155,79 @@ class TestFetchAvailableModelsAt:
             "http://x.invalid/v4", api_key=None
         )
         assert result == frozenset({"ok-1", "ok-2"})
+
+
+class TestFailureBackoff:
+    """The failure TTL doubles per consecutive failure (capped at 1h);
+    a success resets the counter."""
+
+    def _failing_session(self) -> MagicMock:
+        session = MagicMock()
+        session.get.side_effect = RuntimeError("nope")
+        session.close = MagicMock()
+        return session
+
+    def test_failure_ttl_doubles_per_strike(self) -> None:
+        from gigaevo.llm import models as models_mod
+
+        base = models_mod._VERIFY_CACHE_TTL_FAILURE_S
+        cap = models_mod._VERIFY_CACHE_TTL_FAILURE_MAX_S
+        assert models_mod._failure_ttl_for(0) == base
+        assert models_mod._failure_ttl_for(1) == base
+        assert models_mod._failure_ttl_for(2) == base * 2
+        assert models_mod._failure_ttl_for(3) == base * 4
+        # Cap kicks in once the doubling exceeds the ceiling.
+        for n in range(50, 60):
+            assert models_mod._failure_ttl_for(n) == cap
+
+    def test_consecutive_failures_increment_counter(self, monkeypatch) -> None:
+        import gigaevo.infra.requests_factory as rf
+        from gigaevo.llm import models as models_mod
+
+        session = self._failing_session()
+        monkeypatch.setattr(rf, "make_requests_session", lambda *a, **kw: session)
+        url = "http://flaky.invalid"
+
+        # First failure.
+        models_mod._fetch_available_models_at(url, api_key=None)
+        assert models_mod._verify_failure_counts[url] == 1
+
+        # Bypass the failure-cache TTL so the next call re-probes.
+        with models_mod._verify_cache_lock:
+            models_mod._verify_cache.pop(url, None)
+        models_mod._fetch_available_models_at(url, api_key=None)
+        assert models_mod._verify_failure_counts[url] == 2
+
+    def test_success_resets_failure_counter(self, monkeypatch) -> None:
+        import gigaevo.infra.requests_factory as rf
+        from gigaevo.llm import models as models_mod
+
+        url = "http://recover.invalid"
+        failing = self._failing_session()
+        monkeypatch.setattr(
+            rf, "make_requests_session", lambda *a, **kw: failing
+        )
+        models_mod._fetch_available_models_at(url, api_key=None)
+        models_mod._fetch_available_models_at(url, api_key=None)  # cached, no probe
+        assert models_mod._verify_failure_counts[url] == 1
+
+        # Swap in a recovering session and clear the cache so the next
+        # call re-probes.
+        ok_session = MagicMock()
+        ok_response = MagicMock()
+        ok_response.json.return_value = {"data": [{"id": "m1"}]}
+        ok_response.raise_for_status = MagicMock()
+        ok_session.get.return_value = ok_response
+        ok_session.close = MagicMock()
+        monkeypatch.setattr(
+            rf, "make_requests_session", lambda *a, **kw: ok_session
+        )
+        with models_mod._verify_cache_lock:
+            models_mod._verify_cache.pop(url, None)
+
+        result = models_mod._fetch_available_models_at(url, api_key=None)
+        assert result == frozenset({"m1"})
+        assert url not in models_mod._verify_failure_counts
 
 
 class TestVerifyModelsMockTolerance:

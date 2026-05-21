@@ -112,8 +112,16 @@ this adds no value — the upstream's model list changes on the timescale
 of deployments."""
 
 _VERIFY_CACHE_TTL_FAILURE_S = 30.0
-"""Cache failures briefly so retries are still possible without
-re-burning the jitter sleep on every router instantiation."""
+"""Initial failure TTL.  Subsequent consecutive failures back off as
+``_VERIFY_CACHE_TTL_FAILURE_S * 2**(n-1)``, capped at
+``_VERIFY_CACHE_TTL_FAILURE_MAX_S`` so a permanently broken endpoint
+stops re-burning the jitter sleep on every router instantiation."""
+
+_VERIFY_CACHE_TTL_FAILURE_MAX_S = 3600.0
+"""Upper bound on the failure-cache TTL — after enough consecutive
+failures the cache holds the result for at most one hour, then probes
+again. A successful probe resets the counter so the next failure
+starts over at the base TTL."""
 
 _VERIFY_JITTER_MAX_S = 2.0
 """Each probe sleeps a uniform [0, max] seconds before issuing the GET so
@@ -121,7 +129,22 @@ concurrent router constructions land staggered, not synchronously."""
 
 # Maps ``base_url`` -> (cached_at_monotonic, available_models_or_None).
 _verify_cache: dict[str, tuple[float, frozenset[str] | None]] = {}
+# Per-``base_url`` consecutive-failure count; reset on first success.
+_verify_failure_counts: dict[str, int] = {}
 _verify_cache_lock = threading.Lock()
+
+
+def _failure_ttl_for(consecutive_failures: int) -> float:
+    """Return the failure-cache TTL for ``consecutive_failures`` strikes.
+
+    Exponential backoff: ``base * 2**(n-1)`` for ``n>=1``, clamped at
+    the configured ceiling. ``n=0`` (no recorded failure) collapses to
+    the base TTL so a fresh entry never spends zero seconds cached.
+    """
+    if consecutive_failures <= 0:
+        return _VERIFY_CACHE_TTL_FAILURE_S
+    scaled = _VERIFY_CACHE_TTL_FAILURE_S * (2 ** (consecutive_failures - 1))
+    return min(scaled, _VERIFY_CACHE_TTL_FAILURE_MAX_S)
 
 
 def _model_base_url(model: ChatOpenAI) -> str | None:
@@ -165,11 +188,10 @@ def _fetch_available_models_at(
         cached = _verify_cache.get(base_url)
         if cached is not None:
             cached_at, cached_value = cached
-            ttl = (
-                _VERIFY_CACHE_TTL_SUCCESS_S
-                if cached_value is not None
-                else _VERIFY_CACHE_TTL_FAILURE_S
-            )
+            if cached_value is not None:
+                ttl = _VERIFY_CACHE_TTL_SUCCESS_S
+            else:
+                ttl = _failure_ttl_for(_verify_failure_counts.get(base_url, 0))
             if (now - cached_at) < ttl:
                 return cached_value
 
@@ -191,15 +213,40 @@ def _fetch_available_models_at(
             d["id"] for d in data.get("data", []) if isinstance(d, dict) and "id" in d
         )
     except Exception as exc:
-        logger.warning(
-            "[MultiModelRouter] Cannot verify models at {}: {}", base_url, exc
-        )
+        # Log severity scales down on repeat failures: a permanently
+        # broken endpoint should not spam WARNING on every router
+        # instantiation. The first failure stays WARNING; subsequent
+        # failures within the failure-TTL window get one DEBUG line so
+        # the failure mode is still discoverable but does not drown the
+        # log.
+        with _verify_cache_lock:
+            prior_failures = _verify_failure_counts.get(base_url, 0)
+        if prior_failures == 0:
+            logger.warning(
+                "[MultiModelRouter] Cannot verify models at {}: {}", base_url, exc
+            )
+        else:
+            logger.debug(
+                "[MultiModelRouter] Cannot verify models at {} (failure #{}): {}",
+                base_url,
+                prior_failures + 1,
+                exc,
+            )
         available = None
     finally:
         session.close()
 
     with _verify_cache_lock:
         _verify_cache[base_url] = (time.monotonic(), available)
+        if available is None:
+            _verify_failure_counts[base_url] = (
+                _verify_failure_counts.get(base_url, 0) + 1
+            )
+        else:
+            # First success after a failure run resets the counter so
+            # the next failure starts over at the base TTL rather than
+            # immediately jumping back to the prior backoff.
+            _verify_failure_counts.pop(base_url, None)
     return available
 
 
