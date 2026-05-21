@@ -410,15 +410,28 @@ class RedisArchiveStorage(ArchiveStorage):
         return int(count)
 
     async def clear_all_elites(self) -> int:
-        """Clear all elites and reverse index. Returns cells cleared."""
+        """Clear all elites, reverse index, and score sidetable.
+
+        ``{prefix}:archive:scores`` is populated by the Lua swap path
+        and read on every CAS compare. Skipping it on clear leaks one
+        ``hset`` per cell per reindex; over the hundreds of reindexes
+        a long evolution performs, that grows without bound and a
+        subsequent insert into a previously-occupied cell would read a
+        stale score (currently no-ops because the archive hash is the
+        authoritative occupancy record, but a future swap-by-score
+        consumer would silently take the wrong branch).
+        """
         count = await self._hlen()
         if count == 0:
             return 0
+
+        scores_key = f"{self._key_prefix}:archive:scores"
 
         async def _op(r):
             pipe = r.pipeline(transaction=False)
             pipe.delete(self._hash_key)
             pipe.delete(self._reverse_key)
+            pipe.delete(scores_key)
             await pipe.execute()
 
         await self._storage.with_redis("archive:clear_all", _op)
