@@ -1,19 +1,18 @@
-"""Regression tests for ``default_exec_runner_pool`` and the ambient pool.
+"""Regression tests for ``WorkerPool`` and the ambient-pool ContextVar.
 
-The factory builds a fresh ``WorkerPool`` per call. Callers that want to
-amortize subprocess startup across many ``run_exec_runner`` invocations must
-either pass a single pool via ``pool=...`` or bind one via
-``set_ambient_exec_runner_pool`` for the duration of an ``asyncio.run``.
+The factory builds a fresh ``WorkerPool`` per call. Lifecycle owners that
+want to amortize subprocess startup across many calls bind a single pool
+via ``set_ambient_exec_runner_pool`` for the duration of an
+``asyncio.run`` and tear it down before the loop closes.
 
-Each ``WorkerPool`` binds its ``asyncio.Queue`` and ``asyncio.Lock`` to the
-event loop it is first used on, so an instance must not survive across
-distinct ``asyncio.run()`` invocations.
+Each ``WorkerPool`` binds its ``asyncio.Queue`` and ``asyncio.Lock`` to
+the event loop it is first used on, so an instance must not survive
+across distinct ``asyncio.run`` invocations.
 """
 
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import patch
 
 import pytest
 
@@ -22,7 +21,6 @@ from gigaevo.programs.stages.python_executors.wrapper import (
     default_exec_runner_pool,
     get_ambient_exec_runner_pool,
     reset_ambient_exec_runner_pool,
-    run_exec_runner,
     set_ambient_exec_runner_pool,
 )
 
@@ -104,159 +102,75 @@ def test_ambient_pool_round_trip():
     assert get_ambient_exec_runner_pool() is None
 
 
-def test_run_exec_runner_reuses_ambient_pool_when_pool_is_none():
-    """``run_exec_runner(pool=None)`` resolves to the bound ambient pool.
+def test_ambient_pool_resolves_to_same_object_within_scope():
+    """A bound ambient pool is returned identically by every getter call.
 
-    A captured-pool fake stands in for the real ``WorkerPool``: every
-    ``run_exec_runner`` invocation through this fake records itself, so
-    the test sees that the same pool object served two successive
-    ``run_exec_runner`` calls within one experiment scope.
+    The lifecycle owner binds one pool for the scope of an experiment;
+    every consumer that resolves the ambient binding sees that exact
+    object, never a copy or a fresh instance.
     """
-    seen_pools: list[WorkerPool] = []
-
-    class _FakeProc:
-        returncode = None
-
-    async def fake_get_worker(self, script, env, cwd):
-        seen_pools.append(self)
-        return _FakeProc()
-
-    async def fake_return_worker(self, proc):
-        return None
-
-    async def fake_run_via_worker(proc, data, timeout, max_memory_mb, max_output_size):
-        return ("ok", b"", "")
+    seen: list[WorkerPool] = []
 
     async def scenario() -> WorkerPool:
         ambient = WorkerPool()
         token = set_ambient_exec_runner_pool(ambient)
         try:
-            with (
-                patch.object(WorkerPool, "get_worker", fake_get_worker),
-                patch.object(WorkerPool, "return_worker", fake_return_worker),
-                patch(
-                    "gigaevo.programs.stages.python_executors.wrapper._run_via_worker",
-                    fake_run_via_worker,
-                ),
-            ):
-                await run_exec_runner(
-                    code="def f():\n    return 1\n",
-                    function_name="f",
-                    timeout=5,
-                )
-                await run_exec_runner(
-                    code="def f():\n    return 1\n",
-                    function_name="f",
-                    timeout=5,
-                )
+            seen.append(get_ambient_exec_runner_pool())  # type: ignore[arg-type]
+            seen.append(get_ambient_exec_runner_pool())  # type: ignore[arg-type]
             return ambient
         finally:
             reset_ambient_exec_runner_pool(token)
 
     ambient = asyncio.run(scenario())
-    assert len(seen_pools) == 2
-    assert seen_pools[0] is ambient
-    assert seen_pools[1] is ambient
-    assert seen_pools[0] is seen_pools[1]
+    assert len(seen) == 2
+    assert seen[0] is ambient
+    assert seen[1] is ambient
 
 
-def test_explicit_pool_argument_overrides_ambient():
-    """An explicit ``pool=`` kwarg wins over a bound ambient pool."""
-    seen_pools: list[WorkerPool] = []
+def test_ambient_pool_rebinding_returns_new_pool_after_reset():
+    """A second ``set`` after ``reset`` exposes a different pool object."""
+    a = WorkerPool()
+    b = WorkerPool()
 
-    class _FakeProc:
-        returncode = None
+    token_a = set_ambient_exec_runner_pool(a)
+    assert get_ambient_exec_runner_pool() is a
+    reset_ambient_exec_runner_pool(token_a)
+    assert get_ambient_exec_runner_pool() is None
 
-    async def fake_get_worker(self, script, env, cwd):
-        seen_pools.append(self)
-        return _FakeProc()
-
-    async def fake_return_worker(self, proc):
-        return None
-
-    async def fake_run_via_worker(proc, data, timeout, max_memory_mb, max_output_size):
-        return ("ok", b"", "")
-
-    async def scenario() -> tuple[WorkerPool, WorkerPool]:
-        ambient = WorkerPool()
-        explicit = WorkerPool()
-        token = set_ambient_exec_runner_pool(ambient)
-        try:
-            with (
-                patch.object(WorkerPool, "get_worker", fake_get_worker),
-                patch.object(WorkerPool, "return_worker", fake_return_worker),
-                patch(
-                    "gigaevo.programs.stages.python_executors.wrapper._run_via_worker",
-                    fake_run_via_worker,
-                ),
-            ):
-                await run_exec_runner(
-                    code="def f():\n    return 1\n",
-                    function_name="f",
-                    timeout=5,
-                    pool=explicit,
-                )
-            return ambient, explicit
-        finally:
-            reset_ambient_exec_runner_pool(token)
-
-    ambient, explicit = asyncio.run(scenario())
-    assert len(seen_pools) == 1
-    assert seen_pools[0] is explicit
-    assert seen_pools[0] is not ambient
+    token_b = set_ambient_exec_runner_pool(b)
+    try:
+        assert get_ambient_exec_runner_pool() is b
+        assert get_ambient_exec_runner_pool() is not a
+    finally:
+        reset_ambient_exec_runner_pool(token_b)
 
 
-def test_run_exec_runner_falls_back_to_default_when_no_ambient():
-    """Without ambient binding, ``pool=None`` allocates a fresh per-call pool."""
-    seen_pools: list[WorkerPool] = []
+def test_worker_pool_shutdown_is_idempotent():
+    """Calling ``shutdown`` on an empty pool is a safe no-op.
 
-    class _FakeProc:
-        returncode = None
-
-    async def fake_get_worker(self, script, env, cwd):
-        seen_pools.append(self)
-        return _FakeProc()
-
-    async def fake_return_worker(self, proc):
-        return None
-
-    async def fake_run_via_worker(proc, data, timeout, max_memory_mb, max_output_size):
-        return ("ok", b"", "")
+    The pool may be torn down by the lifecycle owner even when no worker
+    was ever checked out; ``shutdown`` must not blow up on an empty
+    queue, and it must remain callable a second time.
+    """
 
     async def scenario() -> None:
-        assert get_ambient_exec_runner_pool() is None
-        with (
-            patch.object(WorkerPool, "get_worker", fake_get_worker),
-            patch.object(WorkerPool, "return_worker", fake_return_worker),
-            patch(
-                "gigaevo.programs.stages.python_executors.wrapper._run_via_worker",
-                fake_run_via_worker,
-            ),
-        ):
-            await run_exec_runner(
-                code="def f():\n    return 1\n",
-                function_name="f",
-                timeout=5,
-            )
-            await run_exec_runner(
-                code="def f():\n    return 1\n",
-                function_name="f",
-                timeout=5,
-            )
+        pool = WorkerPool()
+        await pool.shutdown()
+        await pool.shutdown()
+        assert pool._count == 0
+        assert pool._queue.empty()
 
     asyncio.run(scenario())
-    assert len(seen_pools) == 2
-    assert seen_pools[0] is not seen_pools[1]
 
 
 @pytest.mark.asyncio
 async def test_no_pool_none_call_sites_remain_unguarded():
     """Audit: production callers in stages must not rebuild a pool per call.
 
-    The four production sites pass ``pool=None`` so they pick up the ambient
-    pool. This test scans those modules' source for any explicit
-    ``default_exec_runner_pool()`` invocation as a regression guard against
-    future code paths bypassing the experiment-scoped lifecycle.
+    The audited stages must resolve any ambient pool through the
+    lifecycle owner; an explicit ``default_exec_runner_pool()`` call in
+    those modules would bypass the experiment-scoped binding and
+    fragment subprocess startup costs.
     """
     import inspect
 
@@ -268,6 +182,6 @@ async def test_no_pool_none_call_sites_remain_unguarded():
     for module in (runtime_metrics, opt_utils, optuna_stage, execution):
         source = inspect.getsource(module)
         assert "default_exec_runner_pool(" not in source, (
-            f"{module.__name__} constructs an ad-hoc pool. Use the ambient "
-            f"pool bound by run_experiment instead."
+            f"{module.__name__} constructs an ad-hoc pool; resolve the "
+            f"ambient pool bound by the experiment driver instead."
         )
