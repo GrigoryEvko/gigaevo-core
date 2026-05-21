@@ -19,10 +19,22 @@ _INFRA_YAML = Path(__file__).parent.parent / "experiments" / "infrastructure.yam
 
 
 def get_no_proxy_hosts() -> list[str]:
-    """Read no_proxy_hosts from infrastructure.yaml."""
-    with open(_INFRA_YAML) as f:
-        infra = yaml.safe_load(f)
-    return infra.get("no_proxy_hosts", [])
+    """Read no_proxy_hosts from infrastructure.yaml.
+
+    Returns an empty list when the YAML is missing or malformed so
+    callers (e.g. ``ensure_no_proxy`` invoked at module import time
+    by ``problems/chains/*/shared_config.py``) can keep loading on
+    machines that have not provisioned ``experiments/infrastructure.yaml``.
+    """
+    try:
+        with open(_INFRA_YAML) as f:
+            infra = yaml.safe_load(f)
+    except FileNotFoundError:
+        return []
+    if not isinstance(infra, dict):
+        return []
+    hosts = infra.get("no_proxy_hosts", [])
+    return hosts if isinstance(hosts, list) else []
 
 
 def get_no_proxy_string() -> str:

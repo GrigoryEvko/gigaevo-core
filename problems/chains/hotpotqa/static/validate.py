@@ -1,3 +1,4 @@
+import os
 import re
 from statistics import mean
 
@@ -15,6 +16,12 @@ from problems.chains.hotpotqa.shared_config import (
 from problems.chains.hotpotqa.static.config import STATIC_CHAIN_TOPOLOGY, load_baseline
 from problems.chains.hotpotqa.utils.retrieval import make_batch_tool_fn
 from problems.chains.hotpotqa.utils.utils import normalize_text
+
+# Default sample budget for static-chain validation. Operators tuning
+# wallclock-per-evaluation can override via ``HOTPOTQA_STATIC_N_SAMPLES``;
+# a smaller number is useful for smoke tests and a larger one (up to
+# the full train split) for higher-fidelity scoring.
+_DEFAULT_N_SAMPLES = 300
 
 
 def strip_thinking(text: str) -> str:
@@ -97,9 +104,25 @@ def validate(chain_spec: dict) -> tuple[dict, list[dict]]:
         frozen_baseline=baseline,
     )
 
-    # 2. Load fixed first-300 samples (raw kept for supporting_facts)
-    raw_300 = load_jsonl(DATASET_CONFIG["train_path"])[:300]
-    dataset = [preprocess_sample(s) for s in raw_300]
+    # 2. Load the first ``n_samples`` of the train split (raw kept so
+    #    we can attach supporting_facts to per-sample failure diagnostics
+    #    in step 8 below).
+    n_samples_env = os.environ.get("HOTPOTQA_STATIC_N_SAMPLES")
+    if n_samples_env:
+        try:
+            n_samples = int(n_samples_env)
+        except ValueError as exc:
+            raise ValueError(
+                f"HOTPOTQA_STATIC_N_SAMPLES={n_samples_env!r} is not an integer"
+            ) from exc
+        if n_samples <= 0:
+            raise ValueError(
+                f"HOTPOTQA_STATIC_N_SAMPLES must be positive, got {n_samples}"
+            )
+    else:
+        n_samples = _DEFAULT_N_SAMPLES
+    raw_samples = load_jsonl(DATASET_CONFIG["train_path"])[:n_samples]
+    dataset = [preprocess_sample(s) for s in raw_samples]
     targets = [s[DATASET_CONFIG["target_field"]] for s in dataset]
 
     # 3. Create LLM client
@@ -150,7 +173,7 @@ def validate(chain_spec: dict) -> tuple[dict, list[dict]]:
     # 8. Collect ASI-enhanced failure cases with per-hop retrieval diagnostics
     failures = []
     for raw_s, sample, result, pred, target in zip(
-        raw_300, dataset, results, predictions, targets
+        raw_samples, dataset, results, predictions, targets
     ):
         if pred is None or normalize_text(pred) != normalize_text(str(target)):
             gold_titles = set(raw_s.get("supporting_facts", {}).get("title", []))
