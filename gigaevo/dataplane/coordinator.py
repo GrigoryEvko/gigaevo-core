@@ -1053,8 +1053,18 @@ class DataPlane:
                 )
             )
         prefix = key_prefix if key_prefix is not None else self._connection.key_prefix
+        # ``key_prefix`` is a hierarchical Redis path. The engine-wide
+        # connection prefix (``gigaevo:<experiment>``) already contains
+        # a colon, and per-island archives nest
+        # ``<engine>:<island_id>`` so two experiments sharing an island
+        # id cannot collide. The colon-collision guard only protects
+        # opaque identifiers (cell, candidate_id); hierarchical
+        # prefixes opt out via ``allow_colon=True``.
         self._validate_key_component(
-            prefix, method="try_replace_elite", field_name="key_prefix"
+            prefix,
+            method="try_replace_elite",
+            field_name="key_prefix",
+            allow_colon=True,
         )
         archive_key = f"{prefix}:archive"
         reverse_key = f"{prefix}:archive:reverse"
