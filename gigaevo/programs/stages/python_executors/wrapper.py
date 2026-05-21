@@ -50,7 +50,6 @@ import os
 from pathlib import Path
 import signal
 import socket
-import struct
 import sys
 import tempfile
 import time
@@ -62,7 +61,6 @@ import cloudpickle
 from loguru import logger
 import loky
 from loky.backend.context import get_context
-import psutil
 
 from gigaevo.programs.stages.python_executors.backend import (
     CompleteHandler,
@@ -216,10 +214,9 @@ class WorkerConfig:
 class ExecRunnerError(Exception):
     """User-code failure inside a worker.  ``stderr`` carries the traceback.
 
-    ``stdout_bytes`` holds whatever stdout was captured before the failure
-    (empty for the loky path; the persistent-worker pool path under
-    :func:`_run_via_worker` populates it when a payload size overflows or
-    a cloudpickle round-trip fails downstream of a successful child).
+    ``stdout_bytes`` is reserved for callers that dispatch via the
+    persistent-worker :class:`WorkerPool` path and want to attach raw
+    captured stdout to the raised error; the loky path leaves it empty.
     """
 
     def __init__(
@@ -805,11 +802,10 @@ async def run_exec_runner(
 
 
 # ---------------------------------------------------------------------------
-# Persistent-worker pool lifecycle (used by ``run.py`` to bind an ambient
-# pool for the duration of an experiment). The pool object itself only
-# manages a queue of long-lived subprocess workers; the actual
-# ``run_exec_runner`` execution flows through the loky-backed function
-# above.
+# Persistent-worker pool lifecycle.  The experiment driver builds one pool,
+# binds it as the ambient pool, and tears it down at end of run.  The pool
+# itself manages a bounded queue of long-lived ``exec_runner --worker``
+# subprocesses; dispatch through them is the caller's concern.
 # ---------------------------------------------------------------------------
 
 
@@ -872,9 +868,17 @@ _MAX_POOL_WORKERS = 32
 
 
 class WorkerPool:
-    """
-    Pool of persistent exec_runner subprocesses so multiple executor stages can run in parallel.
-    Pass to run_exec_runner(pool=...) or use the default from default_exec_runner_pool().
+    """Bounded pool of persistent ``exec_runner --worker`` subprocesses.
+
+    Workers are checked out via :meth:`get_worker`, returned via
+    :meth:`return_worker`, and reclaimed via :meth:`discard_worker` /
+    :meth:`shutdown`.  The pool's ``asyncio.Queue`` and ``asyncio.Lock``
+    bind to the running event loop on first use, so an instance must not
+    survive across distinct ``asyncio.run`` invocations.
+
+    Lifecycle owners (typically the experiment driver) build one pool,
+    bind it via :func:`set_ambient_exec_runner_pool` for the duration of
+    a run, then shut it down before the loop closes.
     """
 
     __slots__ = ("max_workers", "_queue", "_count", "_lock")
@@ -956,11 +960,13 @@ _ambient_pool: contextvars.ContextVar[WorkerPool | None] = contextvars.ContextVa
 
 
 def set_ambient_exec_runner_pool(pool: WorkerPool | None) -> contextvars.Token:
-    """Bind ``pool`` as the ambient pool for ``run_exec_runner(pool=None)`` callers.
+    """Bind ``pool`` as the ambient pool for the current contextvars scope.
 
-    The returned token is required by ``reset_ambient_exec_runner_pool`` to
-    restore the previous binding. The ambient pool is consulted only when a
-    caller passes ``pool=None``; explicit ``pool=...`` always wins.
+    Callers that consult the ambient pool resolve a bound instance via
+    :func:`get_ambient_exec_runner_pool` and fall back to their own
+    construction when ``None`` is returned.  The returned token is
+    required by :func:`reset_ambient_exec_runner_pool` to restore the
+    previous binding.
     """
     return _ambient_pool.set(pool)
 
