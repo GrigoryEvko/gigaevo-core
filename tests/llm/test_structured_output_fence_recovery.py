@@ -221,3 +221,79 @@ class TestStructuredOutputFenceRecovery:
         original error propagates."""
         router = self._router()
         assert router._recover_from_invoke_exception(RuntimeError("network")) is None
+
+
+class TestExtractTextContentBlocks:
+    """``AIMessage.content`` ships as ``list[dict | str]`` whenever the
+    upstream provider returns content blocks (Anthropic / Gemini / some
+    OpenAI-compatible routers when reasoning is enabled). ``_extract_text``
+    must concatenate the visible-text blocks so the fence-tolerant recovery
+    path can still re-parse the JSON body when reasoning interleaves the
+    response.
+    """
+
+    @staticmethod
+    def _extract(raw: Any) -> str | None:
+        return _StructuredOutputRouter._extract_text(raw)
+
+    def test_list_with_single_text_block(self) -> None:
+        raw = MagicMock()
+        raw.content = [{"type": "text", "text": '{"name": "a", "score": 0.5}'}]
+        assert self._extract(raw) == '{"name": "a", "score": 0.5}'
+
+    def test_list_with_reasoning_then_text(self) -> None:
+        raw = MagicMock()
+        raw.content = [
+            {"type": "reasoning", "reasoning": "<think>step 1</think>"},
+            {"type": "text", "text": '{"name": "a", "score": 0.5}'},
+        ]
+        assert self._extract(raw) == '{"name": "a", "score": 0.5}'
+
+    def test_list_concatenates_multiple_text_blocks(self) -> None:
+        raw = MagicMock()
+        raw.content = [
+            {"type": "text", "text": '{"name":'},
+            {"type": "text", "text": ' "a", "score": 0.5}'},
+        ]
+        assert self._extract(raw) == '{"name": "a", "score": 0.5}'
+
+    def test_dict_envelope_with_list_content(self) -> None:
+        raw = {"content": [{"type": "text", "text": '{"x": 1}'}]}
+        assert self._extract(raw) == '{"x": 1}'
+
+    def test_list_with_only_reasoning_returns_none(self) -> None:
+        """A list with no visible text yields no recovery candidate. The
+        caller treats ``None`` as 'no recovery possible' and propagates the
+        original parsing error rather than silently inventing one."""
+        raw = MagicMock()
+        raw.content = [{"type": "reasoning", "reasoning": "..."}]
+        assert self._extract(raw) is None
+
+    def test_list_with_bare_string_elements(self) -> None:
+        """Some envelopes emit bare strings interleaved with dict blocks
+        (e.g. partial-stream concatenation). Bare strings count as text."""
+        raw = MagicMock()
+        raw.content = ['{"x"', {"type": "text", "text": ": 1}"}]
+        assert self._extract(raw) == '{"x": 1}'
+
+    def test_list_recovery_round_trip_through_schema(self) -> None:
+        """End-to-end: ``_recover_from_parsing_error`` validates the JSON
+        extracted from a content-block list. Without the list handling,
+        ``_extract_text`` returned ``None`` and recovery silently failed."""
+        router = _StructuredOutputRouter(
+            models=[],
+            model_names=[],
+            probabilities=[],
+            langfuse=None,
+            tracker=MagicMock(),
+            schema=_Schema,
+        )
+        raw = MagicMock()
+        raw.content = [
+            {"type": "reasoning", "reasoning": "thinking..."},
+            {"type": "text", "text": '```json\n{"name": "x", "score": 0.7}\n```'},
+        ]
+        recovered = router._recover_from_parsing_error(raw)
+        assert isinstance(recovered, _Schema)
+        assert recovered.name == "x"
+        assert recovered.score == pytest.approx(0.7)

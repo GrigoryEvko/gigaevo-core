@@ -46,6 +46,33 @@ _MARKDOWN_FENCE_PATTERN = re.compile(
 )
 
 
+def _concat_content_blocks(blocks: list) -> str:
+    """Concatenate the visible-text payload of a langchain content-block list.
+
+    ``AIMessage.content`` arrives as ``list[dict | str]`` whenever the
+    upstream provider emits multiple content blocks (typically a reasoning
+    block followed by the final text). Each dict carries a ``type`` tag and
+    either a ``text`` key (output text) or a model-specific reasoning key.
+    We concatenate every ``text`` value plus any bare string element; blocks
+    without ``text`` (reasoning / tool_use / image) are skipped so the
+    parser never re-sees the reasoning trace as part of the JSON body.
+    """
+    parts: list[str] = []
+    for block in blocks:
+        if isinstance(block, str):
+            parts.append(block)
+            continue
+        if not isinstance(block, dict):
+            continue
+        # Only ``text``-bearing blocks contribute. Reasoning blocks expose
+        # their payload under ``reasoning`` / ``thinking`` and intentionally
+        # stay out of the recovered candidate.
+        value = block.get("text")
+        if isinstance(value, str):
+            parts.append(value)
+    return "".join(parts)
+
+
 def _strip_markdown_fences(text: str) -> str:
     """Return ``text`` with one outer markdown code fence removed.
 
@@ -686,7 +713,13 @@ class _StructuredOutputRouter(Runnable):
         """Return the string content of a langchain message-like ``raw``.
 
         Handles the common shapes: ``BaseMessage`` (``.content`` attr),
-        ``dict`` envelopes (``content`` / ``text`` keys), and bare strings.
+        ``dict`` envelopes (``content`` / ``text`` keys), bare strings, and
+        the list-of-content-blocks shape that Anthropic / Gemini / some
+        OpenAI-compatible routers emit when reasoning is enabled
+        (``[{"type": "reasoning", ...}, {"type": "text", "text": "..."}]``).
+        For list shapes the concatenation of every ``text`` block (or bare
+        string element) is returned so the JSON body survives an interleaved
+        reasoning block.
         """
         if raw is None:
             return None
@@ -695,11 +728,19 @@ class _StructuredOutputRouter(Runnable):
         content = getattr(raw, "content", None)
         if isinstance(content, str):
             return content
+        if isinstance(content, list):
+            text = _concat_content_blocks(content)
+            if text:
+                return text
         if isinstance(raw, dict):
             for key in ("content", "text"):
                 value = raw.get(key)
                 if isinstance(value, str):
                     return value
+                if isinstance(value, list):
+                    text = _concat_content_blocks(value)
+                    if text:
+                        return text
         return None
 
     def invoke(
