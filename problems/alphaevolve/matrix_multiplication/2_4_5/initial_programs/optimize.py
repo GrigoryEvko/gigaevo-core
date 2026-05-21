@@ -41,23 +41,26 @@ def get_constrained_decomposition(
     )
 
 
-@jax.jit
-def train_step(params, opt_state, optimizer, loss_fn):
-    loss, grads = jax.value_and_grad(loss_fn)(params)
-    updates, opt_state = optimizer.update(grads, opt_state, params)
-    params = optax.apply_updates(params, updates)
-    return params, opt_state, loss
+def _make_train_step(optimizer, loss_fn):
+    @jax.jit
+    def _step(params, opt_state):
+        loss, grads = jax.value_and_grad(loss_fn)(params)
+        updates, opt_state = optimizer.update(grads, opt_state, params)
+        params = optax.apply_updates(params, updates)
+        return params, opt_state, loss
+
+    return _step
 
 
 def entrypoint() -> dict:
-    rank = 55
-    num_restarts = 10
-    phase1_steps = 80000
+    rank = 40
+    num_restarts = 2
+    phase1_steps = 3000
     phase1_lr = 0.01
     init_scale = 0.1
     l1_strength = 1e-6
     clamp_range = 4.0
-    phase2_steps = 20000
+    phase2_steps = 800
     phase2_lr = 1e-4
 
     target_tensor = get_matrix_multiplication_tensor(n, m, p)
@@ -80,6 +83,7 @@ def entrypoint() -> dict:
     best_loss_phase1 = float("inf")
     best_latent_decomp = None
     phase1_optimizer = optax.adam(phase1_lr)
+    phase1_step = _make_train_step(phase1_optimizer, phase1_loss_fn)
 
     for i in range(num_restarts):
         main_key, restart_key = jax.random.split(main_key)
@@ -92,12 +96,7 @@ def entrypoint() -> dict:
         opt_state = phase1_optimizer.init(latent_decomp)
 
         for _ in range(phase1_steps):
-            latent_decomp, opt_state, loss = train_step(
-                latent_decomp,
-                opt_state,
-                phase1_optimizer,
-                phase1_loss_fn,
-            )
+            latent_decomp, opt_state, loss = phase1_step(latent_decomp, opt_state)
 
         final_loss = l2_loss_real(
             target_tensor,
@@ -114,11 +113,10 @@ def entrypoint() -> dict:
     continuous_params = get_constrained_decomposition(best_latent_decomp, clamp_range)
     phase2_optimizer = optax.adam(phase2_lr)
     opt_state = phase2_optimizer.init(continuous_params)
+    phase2_step = _make_train_step(phase2_optimizer, phase2_loss_fn)
 
     for step in range(phase2_steps):
-        continuous_params, opt_state, loss = train_step(
-            continuous_params, opt_state, phase2_optimizer, phase2_loss_fn
-        )
+        continuous_params, opt_state, loss = phase2_step(continuous_params, opt_state)
         if loss < 1e-7:
             break
 
