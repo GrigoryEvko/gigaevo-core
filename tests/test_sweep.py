@@ -165,6 +165,126 @@ class TestSweepIsolation:
         assert seeds == [7, 8, 9, 10]
 
 
+class TestSweepNamespaceIsolation:
+    """Per-cell injection of ``--name`` / ``--dataplane.key-prefix``
+    overrides keeps every cell's Redis namespace distinct so the
+    experiment cross-field validator does not reject runs after the
+    first when only non-namespace fields vary.
+    """
+
+    def test_unit_injection_helpers(self) -> None:
+        from gigaevo.sweep import _has_flag, _inject_namespace_overrides
+
+        assert not _has_flag([], frozenset({"--name"}))
+        assert _has_flag(["--name", "x"], frozenset({"--name"}))
+        # Bare-token only; ``--namespace`` is not ``--name``.
+        assert not _has_flag(["--namespace", "x"], frozenset({"--name"}))
+
+        injected = _inject_namespace_overrides(["--seed", "1"], "base", 0)
+        assert "--name" in injected
+        i = injected.index("--name")
+        assert injected[i + 1] == "base_0"
+        j = injected.index("--dataplane.key-prefix")
+        assert injected[j + 1] == "gigaevo:base_0"
+
+        kept = _inject_namespace_overrides(
+            ["--name", "user_choice", "--dataplane.key-prefix", "gigaevo:user_choice"],
+            "base",
+            5,
+        )
+        # User-supplied flags suppress the injection entirely.
+        assert kept.count("--name") == 1
+        assert kept.count("--dataplane.key-prefix") == 1
+
+    def test_three_seeds_run_in_distinct_namespaces(
+        self, tmp_path: Path
+    ) -> None:
+        """Three dry-run cells differing only by seed all succeed; the
+        per-cell namespace injection prevents the validator from
+        rejecting cells 2/3 with a key_prefix-mismatch error."""
+        out_dir = tmp_path / "outputs"
+        out_dir.mkdir()
+        experiment = _write_experiment(tmp_path / "exp.py", out_dir)
+        sweep = _write_sweep(
+            tmp_path / "sweep.py",
+            [["--dry-run", "--seed", str(seed)] for seed in (1, 2, 3)],
+        )
+
+        result = _invoke_sweep(experiment, sweep)
+
+        assert result.returncode == 0, result.stderr
+        run_dirs = sorted(p for p in out_dir.iterdir() if p.is_dir())
+        assert len(run_dirs) == 3
+        names = sorted(
+            json.loads((d / "config.json").read_text())["name"] for d in run_dirs
+        )
+        assert names == ["sweep_test_0", "sweep_test_1", "sweep_test_2"]
+        prefixes = sorted(
+            json.loads((d / "config.json").read_text())["dataplane"]["key_prefix"]
+            for d in run_dirs
+        )
+        assert prefixes == [
+            "gigaevo:sweep_test_0",
+            "gigaevo:sweep_test_1",
+            "gigaevo:sweep_test_2",
+        ]
+
+    def test_parallel_three_seeds_run_in_distinct_namespaces(
+        self, tmp_path: Path
+    ) -> None:
+        """Same as the sequential case under ``--parallel`` — covers
+        BUG-M6: parallel mode previously failed N-1 cells on namespace
+        collision because every subprocess raced for the same Redis
+        prefix."""
+        out_dir = tmp_path / "outputs"
+        out_dir.mkdir()
+        experiment = _write_experiment(tmp_path / "exp.py", out_dir)
+        sweep = _write_sweep(
+            tmp_path / "sweep.py",
+            [["--dry-run", "--seed", str(seed)] for seed in (4, 5, 6)],
+        )
+
+        result = _invoke_sweep(experiment, sweep, parallel=3)
+
+        assert result.returncode == 0, result.stderr
+        run_dirs = sorted(p for p in out_dir.iterdir() if p.is_dir())
+        assert len(run_dirs) == 3
+        names = sorted(
+            json.loads((d / "config.json").read_text())["name"] for d in run_dirs
+        )
+        assert names == ["sweep_test_0", "sweep_test_1", "sweep_test_2"]
+
+    def test_user_supplied_name_is_preserved(self, tmp_path: Path) -> None:
+        """When a cell already pins ``--name`` and the matching prefix,
+        the injection does not double-prepend; the user's choice wins."""
+        out_dir = tmp_path / "outputs"
+        out_dir.mkdir()
+        experiment = _write_experiment(tmp_path / "exp.py", out_dir)
+        sweep = _write_sweep(
+            tmp_path / "sweep.py",
+            [
+                [
+                    "--dry-run",
+                    "--name",
+                    "custom_cell",
+                    "--dataplane.key-prefix",
+                    "gigaevo:custom_cell",
+                    "--seed",
+                    "1",
+                ],
+            ],
+        )
+
+        result = _invoke_sweep(experiment, sweep)
+
+        assert result.returncode == 0, result.stderr
+        run_dirs = [p for p in out_dir.iterdir() if p.is_dir()]
+        assert len(run_dirs) == 1
+        cfg = json.loads((run_dirs[0] / "config.json").read_text())
+        assert cfg["name"] == "custom_cell"
+        assert cfg["dataplane"]["key_prefix"] == "gigaevo:custom_cell"
+
+
 class TestSweepFailurePropagation:
     def test_one_bogus_override_does_not_block_others(self, tmp_path: Path) -> None:
         """Three runs total: the middle run carries an invalid
