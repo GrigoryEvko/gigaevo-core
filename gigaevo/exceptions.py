@@ -11,6 +11,21 @@ class StorageError(GigaEvoError):
     """Storage operation failures."""
 
 
+class TransientStorageError(StorageError):
+    """Storage failure expected to clear on retry (connection blip,
+    backpressure, TTL race). Callers may log at INFO + rate-limit and
+    retry the operation rather than treat the failure as permanent.
+    """
+
+
+class PermanentStorageError(StorageError):
+    """Storage failure that will not clear on retry (corrupt blob,
+    schema drift, FSM rejection). Callers should route the offending
+    record to a quarantine bucket and log at ERROR so the failure
+    surfaces to an operator instead of cycling forever.
+    """
+
+
 class ProgramError(GigaEvoError):
     """Program execution failures."""
 

@@ -132,6 +132,12 @@ class RedisProgramStorage(ProgramStorage):
         # Engine-root permission witness; when supplied, per-call FSM
         # tokens are derived by linear split rather than ad-hoc minted.
         self._engine_root = engine_root
+        # Idempotency guard for close(): the storage instance is owned
+        # by ``run_with_config`` but also touched by the engine and
+        # runner on stop(). Concurrent or repeated close() calls would
+        # otherwise double-release the instance lock and double-close
+        # the connection pool.
+        self._closing = False
 
     # --------------------- Context Manager ---------------------
 
@@ -1261,7 +1267,17 @@ class RedisProgramStorage(ProgramStorage):
     # --------------------- Shutdown ---------------------
 
     async def close(self) -> None:
-        """Close all resources gracefully."""
+        """Close all resources gracefully.
+
+        Idempotent: repeated or concurrent calls land on the
+        ``self._closing`` short-circuit so the engine / runner / runner
+        scaffolding can each invoke ``close`` without double-releasing
+        the instance lock or double-disconnecting the pool.
+        """
+        if self._closing:
+            return
+        self._closing = True
+
         # Release lock first
         if not self.config.read_only:
             await self._lock.release()

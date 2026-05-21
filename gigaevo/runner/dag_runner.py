@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field, computed_field, field_validator
 from gigaevo.database.program_storage import ProgramStorage
 from gigaevo.database.state_manager import ProgramStateManager
 from gigaevo.evolution.scheduling.prioritizer import FIFOPrioritizer, ProgramPrioritizer
+from gigaevo.exceptions import PermanentStorageError, TransientStorageError
 from gigaevo.programs.dag.dag import DAG
 from gigaevo.programs.program import Program
 from gigaevo.programs.program_state import ProgramState
@@ -24,6 +25,12 @@ from gigaevo.utils.text_sanitize import sanitize_for_log
 from gigaevo.utils.trackers.base import LogWriter
 
 __all__ = ["sanitize_for_log"]
+
+# Minimum interval between WARNING-level logs for transient
+# RUNNING -> DONE batch failures. Sub-window failures still increment
+# the metric but log at DEBUG so a sustained outage does not flood
+# the journal with the same line.
+_TRANSIENT_LOG_INTERVAL_S: float = 5.0
 
 if TYPE_CHECKING:
     from gigaevo.dataplane import DataPlane, EngineRoot
@@ -209,6 +216,11 @@ class DagRunner:
         # here instead of writing individually.  _maintain flushes with
         # batch_transition_state (bulk SREM/SADD — 2 commands instead of 2N).
         self._done_queue: list[Program] = []
+        # Wallclock of the last WARNING-level transient-failure log emit
+        # for ``_flush_done_queue``. ``-inf`` so the first failure logs
+        # unconditionally; subsequent failures inside the rate window
+        # downgrade to DEBUG.
+        self._last_transient_log_t: float = float("-inf")
 
         # async metrics collector task (no threads)
         self._metrics_collector_task: asyncio.Task | None = None
@@ -595,7 +607,20 @@ class DagRunner:
                 )
 
     async def _flush_done_queue(self) -> None:
-        """Batch-transition queued DONE programs to Redis."""
+        """Batch-transition queued DONE programs to Redis.
+
+        Splits the failure path by error class:
+
+        - :class:`PermanentStorageError` (schema drift, FSM rejection):
+          each offending program is quarantined into ``status:corrupt``
+          via :meth:`RedisProgramStorage.quarantine_validation_failure`
+          and the batch failure is logged at ERROR.
+        - :class:`TransientStorageError` (transport blip, retry exhaust):
+          logged at WARNING with rate limiting so a sustained outage
+          does not flood the journal; the programs stay queued for the
+          next flush cycle.
+        - Any other ``Exception`` is treated as transient.
+        """
         if not self._done_queue:
             return
         batch = self._done_queue[:]
@@ -609,12 +634,51 @@ class DagRunner:
             logger.debug(
                 "[DagScheduler] batch RUNNING→DONE for {} programs", len(batch)
             )
-        except Exception:
-            logger.exception(
-                "[DagScheduler] batch RUNNING→DONE failed for {} programs",
+            return
+        except PermanentStorageError as exc:
+            logger.error(
+                "[DagScheduler] permanent batch RUNNING→DONE failure for "
+                "{} program(s): {} — quarantining ids and dropping batch",
                 len(batch),
+                exc,
             )
             self._metrics.record_batch_transition_failure(len(batch))
+            quarantine = getattr(
+                self._storage, "quarantine_validation_failure", None
+            )
+            if quarantine is not None:
+                for program in batch:
+                    try:
+                        await quarantine(program.id, exc)
+                    except Exception as q_err:  # noqa: BLE001 - boundary
+                        logger.warning(
+                            "[DagScheduler] quarantine of {} failed: {}",
+                            program.short_id,
+                            q_err,
+                        )
+            return
+        except (TransientStorageError, Exception) as exc:
+            now = time.monotonic()
+            since_last = now - self._last_transient_log_t
+            if since_last >= _TRANSIENT_LOG_INTERVAL_S:
+                logger.warning(
+                    "[DagScheduler] transient batch RUNNING→DONE failure "
+                    "for {} program(s): {} — will retry on next flush",
+                    len(batch),
+                    exc,
+                )
+                self._last_transient_log_t = now
+            else:
+                logger.debug(
+                    "[DagScheduler] transient batch RUNNING→DONE failure "
+                    "(rate-limited; {} ids): {}",
+                    len(batch),
+                    exc,
+                )
+            self._metrics.record_batch_transition_failure(len(batch))
+            # Requeue so the next flush cycle retries. Prepend so the
+            # transition stays FIFO with respect to other late arrivals.
+            self._done_queue = batch + self._done_queue
 
     async def _cancel_task(self, info: TaskInfo) -> None:
         if info.task.done():

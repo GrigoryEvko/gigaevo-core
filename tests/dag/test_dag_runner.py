@@ -927,3 +927,121 @@ class TestMetricsComputed:
         m.loop_iterations = 50
         # started_at is just now, so uptime_seconds == 0
         assert m.average_iterations_per_second == 0.0
+
+
+class TestFlushDoneQueueErrorPaths:
+    """``_flush_done_queue`` distinguishes transient from permanent
+    storage failures: transient errors log at WARNING (rate-limited)
+    and requeue the batch; permanent errors log at ERROR, drop the
+    batch, and route every id through the storage quarantine path.
+    """
+
+    def _seeded_runner(self, program_count: int = 2):
+        progs = [_make_test_program() for _ in range(program_count)]
+        storage = _make_mock_storage()
+        runner = _make_runner(storage=storage)
+        runner._done_queue = list(progs)
+        return runner, storage, progs
+
+    async def test_permanent_failure_quarantines_and_drops(self):
+        from gigaevo.exceptions import PermanentStorageError
+
+        runner, storage, progs = self._seeded_runner()
+        storage.batch_transition_state = AsyncMock(
+            side_effect=PermanentStorageError("schema drift")
+        )
+        # Attach the quarantine helper that the storage layer provides.
+        quarantined: list[str] = []
+
+        async def quarantine(pid: str, exc: Exception) -> None:
+            quarantined.append(pid)
+
+        storage.quarantine_validation_failure = quarantine
+
+        await runner._flush_done_queue()
+
+        # The batch was dropped — the queue is empty.
+        assert runner._done_queue == []
+        # Every program id was routed through the quarantine helper.
+        assert sorted(quarantined) == sorted(p.id for p in progs)
+
+    async def test_transient_failure_requeues_and_logs(self):
+        from gigaevo.exceptions import TransientStorageError
+
+        runner, storage, progs = self._seeded_runner()
+        storage.batch_transition_state = AsyncMock(
+            side_effect=TransientStorageError("blip")
+        )
+
+        await runner._flush_done_queue()
+
+        # The batch was requeued for the next flush cycle.
+        assert runner._done_queue == progs
+
+    async def test_transient_rate_limit_downgrades_to_debug(self):
+        from gigaevo.exceptions import TransientStorageError
+
+        runner, storage, progs = self._seeded_runner()
+        storage.batch_transition_state = AsyncMock(
+            side_effect=TransientStorageError("blip")
+        )
+
+        # First failure logs at WARNING; we observe the wallclock advance.
+        await runner._flush_done_queue()
+        first_logged_at = runner._last_transient_log_t
+        assert first_logged_at != float("-inf")
+
+        # A second failure inside the rate window must not move the
+        # wallclock (the WARNING log is suppressed; only DEBUG runs).
+        await runner._flush_done_queue()
+        assert runner._last_transient_log_t == first_logged_at
+
+
+class TestStorageCloseIdempotency:
+    """``RedisProgramStorage.close()`` is idempotent: repeated calls
+    must not double-release the instance lock or double-disconnect the
+    pool. The engine/runner stop() hooks both invoke close(); without
+    the guard each call would race against the previous one.
+    """
+
+    async def test_close_runs_once_under_repeated_calls(self):
+        import fakeredis.aioredis
+
+        from gigaevo.database.redis import RedisProgramStorageConfig
+        from gigaevo.database.redis_program_storage import RedisProgramStorage
+
+        config = RedisProgramStorageConfig(
+            redis_url="redis://fake:6379/0",
+            key_prefix="idem",
+            read_only=True,  # Skip lock path so we can solo-test close().
+        )
+        storage = RedisProgramStorage(config)
+        server = fakeredis.FakeServer()
+        fake = fakeredis.aioredis.FakeRedis(server=server, decode_responses=True)
+        storage._conn._redis = fake
+        storage._conn._closing = False
+
+        # Track underlying close calls.
+        calls = {"metrics": 0, "conn": 0}
+        orig_metrics_stop = storage._metrics.stop
+        orig_conn_close = storage._conn.close
+
+        async def counting_metrics_stop():
+            calls["metrics"] += 1
+            await orig_metrics_stop()
+
+        async def counting_conn_close():
+            calls["conn"] += 1
+            await orig_conn_close()
+
+        storage._metrics.stop = counting_metrics_stop
+        storage._conn.close = counting_conn_close
+
+        await storage.close()
+        await storage.close()
+        await storage.close()
+
+        # Each underlying helper ran exactly once across the three
+        # close() calls.
+        assert calls["metrics"] == 1
+        assert calls["conn"] == 1
