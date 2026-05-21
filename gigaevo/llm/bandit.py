@@ -863,4 +863,5 @@ class BanditModelRouter(MultiModelRouter):
             select_override=_bandit_select,
             failure_hook=self._inject_failure_reward,
             schema=schema,
+            circuit_breaker=self._circuit_breaker,
         )

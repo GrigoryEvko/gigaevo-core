@@ -19,6 +19,11 @@ from langfuse.langchain import CallbackHandler
 from loguru import logger
 from pydantic import BaseModel, ValidationError
 
+from gigaevo.llm.circuit_breaker import (
+    CircuitBreakerConfig,
+    CircuitOpenError,
+    LLMCircuitBreaker,
+)
 from gigaevo.llm.token_tracking import TokenTracker
 from gigaevo.utils.text_sanitize import clean_identifier, sanitize_for_log
 from gigaevo.utils.trackers.base import LogWriter
@@ -309,6 +314,9 @@ class MultiModelRouter(Runnable):
         probabilities: list[float],
         writer: LogWriter | None = None,
         name: str = "default",
+        *,
+        circuit_breaker: LLMCircuitBreaker | None = None,
+        circuit_breaker_config: CircuitBreakerConfig | None = None,
     ):
         if len(models) != len(probabilities):
             raise ValueError(
@@ -317,6 +325,19 @@ class MultiModelRouter(Runnable):
         if any(p <= 0 for p in probabilities):
             raise ValueError("All probabilities must be positive")
 
+        # Inject a pre-built breaker (production code threads the
+        # config-derived instance through here), or fall back to a
+        # default-configured per-router breaker.  ``None`` for both is
+        # the legacy path; callers that have not opted in keep the
+        # pre-breaker behaviour.
+        if circuit_breaker is not None:
+            self._circuit_breaker = circuit_breaker
+        elif circuit_breaker_config is not None:
+            self._circuit_breaker = LLMCircuitBreaker(
+                name=name, config=circuit_breaker_config
+            )
+        else:
+            self._circuit_breaker = LLMCircuitBreaker(name=name)
         self.models = models
         # ChatOpenAI.model_name comes from operator config / env interpolation
         # / occasionally LLM-generated overrides; control characters there
@@ -446,19 +467,43 @@ class MultiModelRouter(Runnable):
     ) -> RunnableConfig | None:
         return _with_langfuse(config, self._langfuse, model_name)
 
+    @property
+    def circuit_breaker(self) -> LLMCircuitBreaker:
+        return self._circuit_breaker
+
     def invoke(
         self, input: LanguageModelInput, config: RunnableConfig | None = None, **kwargs
     ) -> BaseMessage:
+        self._circuit_breaker.guard()
         model, name = self._select()
-        response = model.invoke(input, self._config(config, name), **kwargs)
+        try:
+            response = model.invoke(input, self._config(config, name), **kwargs)
+        except CircuitOpenError:
+            # Already accounted by ``guard``; re-raise so upstream sees
+            # the canonical open-breaker error.
+            raise
+        except Exception:
+            self._circuit_breaker.record_failure()
+            raise
+        self._circuit_breaker.record_success()
         self._tracker.track(response, name)
         return response
 
     async def ainvoke(
         self, input: LanguageModelInput, config: RunnableConfig | None = None, **kwargs
     ) -> BaseMessage:
+        self._circuit_breaker.guard()
         model, name = self._select()
-        response = await model.ainvoke(input, self._config(config, name), **kwargs)
+        try:
+            response = await model.ainvoke(
+                input, self._config(config, name), **kwargs
+            )
+        except CircuitOpenError:
+            raise
+        except Exception:
+            self._circuit_breaker.record_failure()
+            raise
+        self._circuit_breaker.record_success()
         self._tracker.track(response, name)
         return response
 
@@ -490,7 +535,9 @@ class MultiModelRouter(Runnable):
         ``schema`` is forwarded to the underlying ``ChatOpenAI`` wrappers
         *and* retained on the resulting router so the fallback parser can
         re-validate a fence-stripped payload on a ``parsing_error``
-        without re-issuing the LLM call.
+        without re-issuing the LLM call. The shared circuit breaker is
+        also threaded through so the structured-output path participates
+        in the same open / half-open lifecycle.
         """
         wrapped = [
             m.with_structured_output(schema, include_raw=True, **kwargs)
@@ -504,6 +551,7 @@ class MultiModelRouter(Runnable):
             self._tracker,
             task_model_map=self._task_model_map,
             schema=schema,
+            circuit_breaker=self._circuit_breaker,
         )
 
 
@@ -521,6 +569,7 @@ class _StructuredOutputRouter(Runnable):
         select_override: Callable[[], tuple[Any, str]] | None = None,
         failure_hook: Callable[[BaseException, str], None] | None = None,
         schema: Any | None = None,
+        circuit_breaker: LLMCircuitBreaker | None = None,
     ):
         self._models = models
         self._names = model_names
@@ -540,6 +589,12 @@ class _StructuredOutputRouter(Runnable):
         # ``parsing_error``. ``None`` for dict / TypedDict schemas — the
         # fallback parser is skipped in that case.
         self._schema = schema
+        # Optional breaker reference; ``None`` means "structured path
+        # operates breakerless" (test paths that built the router
+        # directly). Production wiring threads in the parent router's
+        # breaker so the structured-output path participates in the
+        # same lifecycle.
+        self._circuit_breaker = circuit_breaker
 
     def _select(self) -> tuple[Any, str]:
         if self._select_override is not None:
@@ -632,6 +687,8 @@ class _StructuredOutputRouter(Runnable):
     def invoke(
         self, input: LanguageModelInput, config: RunnableConfig | None = None, **kwargs
     ) -> Any:
+        if self._circuit_breaker is not None:
+            self._circuit_breaker.guard()
         model, name = self._select()
         try:
             response = model.invoke(input, self._config(config, name), **kwargs)
@@ -640,21 +697,33 @@ class _StructuredOutputRouter(Runnable):
             # malformed structured response, missing parsed field). Treat
             # those failures as call failures for ledger-symmetry purposes
             # so the failure_hook fires.
-            return self._process(response, name)
+            result = self._process(response, name)
         except BaseException as exc:
+            if not isinstance(exc, CircuitOpenError) and self._circuit_breaker is not None:
+                self._circuit_breaker.record_failure()
             self._maybe_fire_failure_hook(exc, name)
             raise
+        if self._circuit_breaker is not None:
+            self._circuit_breaker.record_success()
+        return result
 
     async def ainvoke(
         self, input: LanguageModelInput, config: RunnableConfig | None = None, **kwargs
     ) -> Any:
+        if self._circuit_breaker is not None:
+            self._circuit_breaker.guard()
         model, name = self._select()
         try:
             response = await model.ainvoke(input, self._config(config, name), **kwargs)
-            return self._process(response, name)
+            result = self._process(response, name)
         except BaseException as exc:
+            if not isinstance(exc, CircuitOpenError) and self._circuit_breaker is not None:
+                self._circuit_breaker.record_failure()
             self._maybe_fire_failure_hook(exc, name)
             raise
+        if self._circuit_breaker is not None:
+            self._circuit_breaker.record_success()
+        return result
 
     def _maybe_fire_failure_hook(self, exc: BaseException, name: str) -> None:
         if self._failure_hook is None:
