@@ -618,14 +618,17 @@ class _StructuredOutputRouter(Runnable):
             self._tracker.track(raw, name)
         parsing_error = response.get("parsing_error")
         parsed = response.get("parsed")
-        if parsing_error is not None and parsed is None:
-            # langchain's ``include_raw=True`` surfaces schema-validation
-            # failures as ``response['parsing_error']`` with ``parsed=None``.
-            # Sonnet / Gemini frequently wrap structured replies in markdown
-            # fences (``` ```json …``` ```) even under ``response_format``
-            # contracts; the inner parser then chokes on the fence chars.
-            # Try a tolerant re-parse against the schema before treating
-            # the call as a genuine failure.
+        # langchain's ``include_raw=True`` typically surfaces schema-
+        # validation failures as ``response['parsing_error']`` with
+        # ``parsed=None``. Sonnet / Gemini frequently wrap structured
+        # replies in markdown fences (``` ```json …``` ```) even under
+        # ``response_format`` contracts; the inner parser then chokes on
+        # the fence chars. A second class of failure has the inner
+        # parser swallow the error and return ``{parsed: None,
+        # parsing_error: None}`` — both shapes need the same tolerant
+        # re-parse against the schema before we treat the call as a
+        # genuine failure.
+        if parsed is None:
             recovered = self._recover_from_parsing_error(raw)
             if recovered is not None:
                 return recovered
@@ -633,9 +636,15 @@ class _StructuredOutputRouter(Runnable):
             # ``try / except`` and the bandit's failure_hook would never
             # fire — the pull was recorded by ``_select`` but the reward
             # window would never get a matching entry. Raise the
-            # parsing_error so the call site routes it through the
-            # existing failure path.
-            raise parsing_error
+            # parsing_error when langchain surfaced one, otherwise raise
+            # a typed ValueError so the failure path is uniform.
+            if parsing_error is not None:
+                raise parsing_error
+            raise ValueError(
+                "_StructuredOutputRouter: structured response had "
+                "parsed=None and no parsing_error; tolerant re-parse "
+                "also failed."
+            )
         return parsed
 
     def _recover_from_parsing_error(self, raw: Any) -> Any:
@@ -645,6 +654,11 @@ class _StructuredOutputRouter(Runnable):
         unknown, the raw payload is not a string-bearing message, or
         re-validation fails. The caller treats ``None`` as "no recovery
         possible" and raises the original ``parsing_error``.
+
+        Attempts two payloads: the fence-stripped body (if a fence was
+        present) and the original text. The second attempt covers
+        responses where the inner parser failed for non-fence reasons
+        (extra whitespace / preamble) but the JSON body still validates.
         """
         if self._schema is None or not isinstance(self._schema, type):
             return None
@@ -653,15 +667,19 @@ class _StructuredOutputRouter(Runnable):
         text = self._extract_text(raw)
         if not text:
             return None
+        candidates = []
         stripped = _strip_markdown_fences(text)
-        if stripped == text:
-            return None
-        try:
-            return self._schema.model_validate_json(stripped)
-        except ValidationError:
-            return None
-        except Exception:
-            return None
+        if stripped != text:
+            candidates.append(stripped)
+        candidates.append(text.strip())
+        for candidate in candidates:
+            try:
+                return self._schema.model_validate_json(candidate)
+            except ValidationError:
+                continue
+            except Exception:
+                continue
+        return None
 
     @staticmethod
     def _extract_text(raw: Any) -> str | None:
@@ -699,6 +717,11 @@ class _StructuredOutputRouter(Runnable):
             # so the failure_hook fires.
             result = self._process(response, name)
         except BaseException as exc:
+            recovered = self._recover_from_invoke_exception(exc)
+            if recovered is not None:
+                if self._circuit_breaker is not None:
+                    self._circuit_breaker.record_success()
+                return recovered
             if not isinstance(exc, CircuitOpenError) and self._circuit_breaker is not None:
                 self._circuit_breaker.record_failure()
             self._maybe_fire_failure_hook(exc, name)
@@ -717,6 +740,11 @@ class _StructuredOutputRouter(Runnable):
             response = await model.ainvoke(input, self._config(config, name), **kwargs)
             result = self._process(response, name)
         except BaseException as exc:
+            recovered = self._recover_from_invoke_exception(exc)
+            if recovered is not None:
+                if self._circuit_breaker is not None:
+                    self._circuit_breaker.record_success()
+                return recovered
             if not isinstance(exc, CircuitOpenError) and self._circuit_breaker is not None:
                 self._circuit_breaker.record_failure()
             self._maybe_fire_failure_hook(exc, name)
@@ -724,6 +752,30 @@ class _StructuredOutputRouter(Runnable):
         if self._circuit_breaker is not None:
             self._circuit_breaker.record_success()
         return result
+
+    def _recover_from_invoke_exception(self, exc: BaseException) -> Any:
+        """When the langchain wrapper raises a parse/validation error
+        directly (instead of routing it through ``parsing_error`` on the
+        ``include_raw=True`` envelope), try to recover by re-parsing
+        text reachable from the exception. ``langchain_core``'s
+        ``OutputParserException`` carries the raw model output on
+        ``llm_output``; pydantic's ``ValidationError`` may carry it via
+        ``input`` on Pydantic v2.
+
+        Returns the parsed schema on success, ``None`` otherwise. The
+        caller treats ``None`` as "no recovery" and lets the original
+        exception propagate.
+        """
+        if self._schema is None or not isinstance(self._schema, type):
+            return None
+        if not issubclass(self._schema, BaseModel):
+            return None
+        for attr in ("llm_output", "input"):
+            payload = getattr(exc, attr, None)
+            recovered = self._recover_from_parsing_error(payload)
+            if recovered is not None:
+                return recovered
+        return None
 
     def _maybe_fire_failure_hook(self, exc: BaseException, name: str) -> None:
         if self._failure_hook is None:

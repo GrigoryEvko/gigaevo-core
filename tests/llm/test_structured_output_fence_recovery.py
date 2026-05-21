@@ -142,3 +142,82 @@ class TestStructuredOutputFenceRecovery:
         router = MultiModelRouter(models, [1.0], writer=NullWriter(), name="t")
         structured = router.with_structured_output(_Schema)
         assert structured._schema is _Schema
+
+    def test_recovers_when_parsing_error_absent(self) -> None:
+        """Some langchain versions return ``{parsed: None, parsing_error: None}``
+        when the inner parser swallows the error. The recovery path must
+        still fire on a fenced payload."""
+        raw = MagicMock()
+        raw.content = '```json\n{"name": "spec", "score": 0.5}\n```'
+        router = self._router()
+        result = router._process(
+            {"raw": raw, "parsed": None, "parsing_error": None},
+            "test-model",
+        )
+        assert isinstance(result, _Schema)
+        assert result.score == pytest.approx(0.5)
+
+    def test_recovers_unfenced_payload_with_whitespace(self) -> None:
+        """Plain JSON with stray leading whitespace also recovers — the
+        original parser may fail for non-fence reasons but the JSON body
+        itself is valid."""
+        raw = MagicMock()
+        raw.content = '\n\n   {"name": "spec", "score": 0.25}   \n'
+        router = self._router()
+        result = router._process(
+            {"raw": raw, "parsed": None, "parsing_error": None},
+            "test-model",
+        )
+        assert isinstance(result, _Schema)
+        assert result.score == pytest.approx(0.25)
+
+    def test_raises_typed_value_error_when_recovery_fails(self) -> None:
+        """When ``parsing_error`` is missing AND recovery returns ``None``,
+        ``_process`` raises a typed ``ValueError`` so the call site routes
+        through the standard failure path (instead of silently returning
+        ``None`` which would skip the failure_hook)."""
+        raw = MagicMock()
+        raw.content = "this is not JSON at all"
+        router = self._router()
+        with pytest.raises(ValueError, match="parsed=None"):
+            router._process(
+                {"raw": raw, "parsed": None, "parsing_error": None},
+                "test-model",
+            )
+
+    def test_recover_from_invoke_exception_uses_llm_output(self) -> None:
+        """When langchain raises an exception that carries the raw model
+        output on ``llm_output`` (``OutputParserException`` style), the
+        invoke-side recovery path retries the schema against the
+        fence-stripped payload."""
+        router = self._router()
+
+        class _ParserExc(Exception):
+            pass
+
+        exc = _ParserExc("parse failed")
+        exc.llm_output = '```json\n{"name": "spec", "score": 0.9}\n```'
+        recovered = router._recover_from_invoke_exception(exc)
+        assert isinstance(recovered, _Schema)
+        assert recovered.score == pytest.approx(0.9)
+
+    def test_recover_from_invoke_exception_uses_validation_error_input(self) -> None:
+        """Pydantic v2 ``ValidationError`` carries the offending payload on
+        ``input``; the invoke-side recovery path looks there too."""
+        router = self._router()
+        try:
+            _Schema.model_validate({"name": "spec", "score": "not a number"})
+        except ValidationError as e:
+            ve = e
+        else:  # pragma: no cover
+            pytest.fail("test setup: malformed payload unexpectedly parsed")
+        ve.input = '```json\n{"name": "spec", "score": 1.0}\n```'  # type: ignore[attr-defined]
+        recovered = router._recover_from_invoke_exception(ve)
+        assert isinstance(recovered, _Schema)
+        assert recovered.score == pytest.approx(1.0)
+
+    def test_recover_from_invoke_exception_returns_none_without_payload(self) -> None:
+        """A bare exception with no usable payload yields ``None`` so the
+        original error propagates."""
+        router = self._router()
+        assert router._recover_from_invoke_exception(RuntimeError("network")) is None
