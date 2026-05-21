@@ -506,6 +506,17 @@ async def run_with_config(cfg: ExperimentConfig) -> int:
                 stop_coros=(evolution_engine.stop(), dag_runner.stop()),
                 on_stop=(evolution_engine.task, dag_runner.task),
             )
+            # Sample archive size while the storage pool is still open;
+            # ``evolution_engine.stop()`` in the finally block closes
+            # storage and any subsequent read would raise and collapse
+            # ``archive_size_after`` to the (zero) baseline — which would
+            # then trip the silent-failure exit code on every clean run.
+            try:
+                archive_size_after = len(
+                    await evolution_engine.strategy.get_program_ids()
+                )
+            except Exception:
+                archive_size_after = archive_size_before
         finally:
             # Idempotent stops: covers the path where something between
             # start() and serve_until_signal raises and leaves the
@@ -521,12 +532,6 @@ async def run_with_config(cfg: ExperimentConfig) -> int:
                 await dag_runner.stop()
             except Exception:
                 logger.exception("[run] dag_runner.stop raised")
-            try:
-                archive_size_after = len(
-                    await evolution_engine.strategy.get_program_ids()
-                )
-            except Exception:
-                archive_size_after = archive_size_before
 
         return _resolve_exit_code(
             dag_runner,
