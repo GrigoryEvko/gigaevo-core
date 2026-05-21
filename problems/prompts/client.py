@@ -176,17 +176,21 @@ class LLMClient:
         await self.client.close()
 
     def copy(self) -> LLMClient:
-        """Create an isolated copy with fresh call logs.
+        """Create a per-call view that shares cost-tracking state with the parent.
 
-        The copy shares the underlying AsyncOpenAI client (stateless)
-        but has independent call logs for parallel processing.
+        The copy shares the underlying AsyncOpenAI client (stateless) AND
+        the ``_call_logs`` list reference so per-call appends accumulate on
+        the parent. The budget guard above sums across all copies through
+        this shared list; a fresh-list copy would let each parallel call
+        see only its own cost and bypass ``max_cost`` by a factor equal to
+        the parallel fan-out.
         """
         client = LLMClient.__new__(LLMClient)
         client.model = self.model
         client.max_cost = self.max_cost
         client.model_pricing = self.model_pricing
         client.generation_kwargs = self.generation_kwargs
-        client.client = self.client  # Share client (stateless)
-        client._call_logs = []  # Fresh logs
+        client.client = self.client
+        client._call_logs = self._call_logs
 
         return client

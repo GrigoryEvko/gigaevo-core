@@ -148,10 +148,14 @@ class LLMClient:
         await self.client.close()
 
     def copy(self) -> "LLMClient":
-        """Create an isolated copy with fresh call logs.
+        """Create a per-call view that shares cost-tracking state with the parent.
 
-        The copy shares the underlying AsyncOpenAI client (stateless)
-        but has independent call logs for parallel processing.
+        The copy shares the underlying AsyncOpenAI client (stateless) AND
+        the ``_call_logs`` list reference so per-call appends accumulate on
+        the parent. Any caller that ``gather()``s over ``client.copy()`` and
+        inspects ``client.call_logs`` afterwards sees the full per-call
+        ledger; a fresh-list copy would orphan those appends and budget
+        guards / cost aggregators would observe zero.
         """
         client = LLMClient.__new__(LLMClient)
         client.model = self.model
@@ -159,5 +163,5 @@ class LLMClient:
         client.model_pricing = self.model_pricing
         client.generation_kwargs = self.generation_kwargs
         client.client = self.client
-        client._call_logs = []
+        client._call_logs = self._call_logs
         return client
