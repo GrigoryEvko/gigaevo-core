@@ -93,3 +93,58 @@ def test_compute_layout_metrics_nondegenerate_unchanged(heilbron_validate) -> No
     metrics = heilbron_validate.compute_layout_metrics(pts)
     # Quick sanity: a roughly-spread random cluster has a non-trivial hull.
     assert metrics["convex_hull_area"] > 0.01
+
+
+def test_compute_layout_metrics_all_collinear(heilbron_validate) -> None:
+    """A perfectly collinear layout — every triangle has area 0 — must
+    not crash the histogram step.
+
+    ``compute_layout_metrics`` builds a log-spaced bin array from the
+    observed (min_area, max_area) pair. With all-zero areas this
+    reduces to ``geomspace(1e-8, ~1e-16, …)`` which is monotonically
+    decreasing and ``np.histogram`` raises ``ValueError: bins must
+    increase monotonically``. The validator must clamp both ends so
+    degenerate layouts collapse into the lowest bin instead of
+    propagating the failure to the program-evaluation pipeline."""
+    side = (4.0 / np.sqrt(3.0)) ** 0.5
+    centroid_y = side * np.sqrt(3.0) / 6.0
+    xs = np.linspace(0.1, 0.6, 11)
+    pts = np.column_stack([xs, np.full(11, centroid_y)])
+    metrics = heilbron_validate.compute_layout_metrics(pts)
+    # All triangle areas are zero — the histogram-derived metrics
+    # should fall back to safe sentinel values rather than NaN / raise.
+    assert metrics["mean_triangle_area"] == 0.0
+    assert np.isfinite(metrics["triangle_area_hist_entropy"])
+    assert np.isfinite(metrics["triangle_area_mean_bin"])
+    assert 0.0 <= metrics["triangle_area_low_bin_frac"] <= 1.0
+
+
+def test_validate_accepts_arc_seed_layout(heilbron_validate) -> None:
+    """End-to-end: the ``arc`` initial-program seed lays 11 points along
+    a curve, producing min_area = 0 and max_area on the order of 1e-16.
+
+    The validator used to raise ``ValueError: bins must increase
+    monotonically`` for this input and the LLM mutation loop silently
+    dropped the seed from the population — empirically the same class
+    of failure as BUG-L2 but inside ``compute_layout_metrics`` rather
+    than ``ConvexHull``. The post-fix validator must return a valid
+    metrics dict with ``fitness == 0`` and ``is_valid == 1``."""
+    # Lift the layout straight from problems/heilbron/initial_programs/arc.py
+    # without importing it (the seed module installs np.random.seed
+    # side-effects and the test should stay hermetic).
+    side = (4.0 / np.sqrt(3.0)) ** 0.5
+    height = np.sqrt(3.0) / 2.0 * side
+    A = np.array([0.0, 0.0])
+    B = np.array([side, 0.0])
+    C = np.array([side / 2.0, height])
+    pts = []
+    for i in range(11):
+        t = i / 10.0
+        P1 = (1.0 - t) * A + t * B
+        P2 = (1.0 - t) * B + t * C
+        pts.append((P1 + P2) / 2.0)
+    pts = np.asarray(pts)
+    result = heilbron_validate.validate(pts)
+    assert result["is_valid"] == 1
+    assert result["fitness"] == 0.0
+    assert np.isfinite(result["triangle_area_hist_entropy"])

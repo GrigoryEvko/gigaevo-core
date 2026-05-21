@@ -74,14 +74,31 @@ def compute_layout_metrics(points: np.ndarray) -> dict:
     hull = ConvexHull(points, qhull_options="QJ")
     convex_hull_area = hull.volume
 
+    # ``geomspace`` requires strictly-increasing endpoints, so the
+    # near-degenerate layouts that survive ConvexHull joggling still
+    # need both ends clamped: an all-collinear set has min_area = 0
+    # and max_area on the order of 1e-16, which produces a decreasing
+    # bin array and crashes ``np.histogram``. Floor both endpoints
+    # and add a separation factor so the bin edges are always
+    # monotone; degenerate inputs collapse into the lowest bin, the
+    # downstream entropy / mean-bin metrics stay finite, and the
+    # validator never raises from a malformed histogram.
     min_area, max_area = np.min(areas), np.max(areas)
-    log_bins = np.geomspace(max(min_area, 1e-8), max_area, num=16)  # 8 bins
+    lo = max(float(min_area), 1e-8)
+    hi = max(float(max_area), lo * (1.0 + 1e-3))
+    log_bins = np.geomspace(lo, hi, num=16)  # 8 bins
     hist, bin_edges = np.histogram(areas, bins=log_bins)
 
-    low_bin_frac = np.sum(hist[:3]) / np.sum(hist)
-    probs = hist / np.sum(hist)
-    entropy = -np.sum(probs[probs > 0] * np.log(probs[probs > 0]))
-    mean_bin = np.average(np.arange(len(hist)), weights=hist)
+    hist_total = int(np.sum(hist))
+    if hist_total == 0:
+        low_bin_frac = 0.0
+        entropy = 0.0
+        mean_bin = 0.0
+    else:
+        low_bin_frac = float(np.sum(hist[:3])) / hist_total
+        probs = hist / hist_total
+        entropy = float(-np.sum(probs[probs > 0] * np.log(probs[probs > 0])))
+        mean_bin = float(np.average(np.arange(len(hist)), weights=hist))
 
     return {
         "mean_triangle_area": float(np.mean(areas)),
