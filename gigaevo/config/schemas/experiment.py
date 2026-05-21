@@ -62,6 +62,27 @@ class ExperimentConfig(FrozenStrictModel):
     prompt_fetcher: PromptFetcherConfig | None = None
 
     @model_validator(mode="after")
+    def _redis_coords_match_dataplane(self) -> ExperimentConfig:
+        """Reject configs whose top-level ``redis`` diverges from
+        ``dataplane.redis``. The program-storage layer reads
+        ``self.redis`` while the dataplane coordinator reads
+        ``self.dataplane.redis``; two different ``RedisConfig`` values
+        produce a split-brain run that writes program state to one
+        Redis and migration coordination to another. The validator
+        compares by value (``__eq__`` on the frozen models) so two
+        textually-equivalent declarations are accepted, while any
+        host / port / db / credential drift fails the load."""
+        if self.redis != self.dataplane.redis:
+            raise ValueError(
+                f"experiment {self.name!r}: redis ({self.redis.url}) and "
+                f"dataplane.redis ({self.dataplane.redis.url}) must "
+                "resolve to the same coordinates. The program-storage and "
+                "the dataplane coordinator share one Redis backing; "
+                "divergence produces a split-brain run."
+            )
+        return self
+
+    @model_validator(mode="after")
     def _key_prefix_follows_convention(self) -> ExperimentConfig:
         expected = _KEY_PREFIX_TEMPLATE.format(name=self.name)
         if self.dataplane.key_prefix != expected:

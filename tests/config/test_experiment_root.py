@@ -144,6 +144,51 @@ class TestKeyPrefixConvention:
         assert cfg.expected_key_prefix == "gigaevo:foo_bar"
 
 
+class TestRedisCoordsMatchDataplane:
+    """``cfg.redis`` (program storage) and ``cfg.dataplane.redis``
+    (migration coordinator) must point at the same Redis instance;
+    silent divergence produces a split-brain run."""
+
+    def test_matching_coords_accepted(self) -> None:
+        redis = RedisConfig(host="r", port=6380, db=2)
+        cfg = ExperimentConfig(
+            **_kwargs(
+                redis=redis,
+                dataplane=DataPlaneSettings(
+                    redis=RedisConfig(host="r", port=6380, db=2),
+                    key_prefix="gigaevo:hotpot_test",
+                ),
+            )
+        )
+        assert cfg.redis == cfg.dataplane.redis
+
+    def test_host_divergence_rejected(self) -> None:
+        redis = RedisConfig(host="r")
+        with pytest.raises(ValidationError, match="split-brain"):
+            ExperimentConfig(
+                **_kwargs(
+                    redis=redis,
+                    dataplane=DataPlaneSettings(
+                        redis=RedisConfig(host="other"),
+                        key_prefix="gigaevo:hotpot_test",
+                    ),
+                )
+            )
+
+    def test_db_divergence_rejected(self) -> None:
+        redis = RedisConfig(db=0)
+        with pytest.raises(ValidationError, match="split-brain"):
+            ExperimentConfig(
+                **_kwargs(
+                    redis=redis,
+                    dataplane=DataPlaneSettings(
+                        redis=RedisConfig(db=3),
+                        key_prefix="gigaevo:hotpot_test",
+                    ),
+                )
+            )
+
+
 class TestMultiIslandMaxSize:
     def test_cap_with_remover_passes(self) -> None:
         algo = MultiIslandConfig(
