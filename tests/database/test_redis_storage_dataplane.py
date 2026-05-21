@@ -413,6 +413,60 @@ class TestSafeDeserializeNoRename:
         assert prog.stage_results == {} and isinstance(prog.stage_results, dict)
         assert prog.metadata == {} and isinstance(prog.metadata, dict)
 
+    def test_lineage_empty_dict_coerced_back_to_list(self) -> None:
+        """A blob with ``lineage.parents`` / ``lineage.children`` stored
+        as ``{}`` (the cjson empty-table corruption pattern emitted by
+        the Lua script before its post-encode fix) reloads as a Program
+        with both fields as empty lists. Defense-in-depth path that
+        upgrades records persisted by an older script version.
+        """
+        from gigaevo.utils.json import dumps as _dumps
+
+        blob = {
+            "id": str(uuid.uuid4()),
+            "code": "def f(): pass",
+            "state": "queued",
+            "lineage": {
+                "parents": {},
+                "children": {},
+                "mutation": None,
+                "generation": 1,
+            },
+            "atomic_counter": 1,
+        }
+        raw = _dumps(blob)
+        prog = RedisProgramStorage._safe_deserialize(raw, ctx="lineage-corrupt")
+        assert prog is not None
+        assert prog.lineage.parents == [] and isinstance(prog.lineage.parents, list)
+        assert prog.lineage.children == [] and isinstance(prog.lineage.children, list)
+
+    def test_lineage_populated_list_preserved(self) -> None:
+        """Non-empty list fields are not touched by the coercion: the
+        coercion only fires on empty ``dict`` values."""
+        from gigaevo.utils.json import dumps as _dumps
+
+        pid = str(uuid.uuid4())
+        parent_a = str(uuid.uuid4())
+        parent_b = str(uuid.uuid4())
+        child_a = str(uuid.uuid4())
+        blob = {
+            "id": pid,
+            "code": "def f(): pass",
+            "state": "queued",
+            "lineage": {
+                "parents": [parent_a, parent_b],
+                "children": [child_a],
+                "mutation": "mutate",
+                "generation": 2,
+            },
+            "atomic_counter": 1,
+        }
+        raw = _dumps(blob)
+        prog = RedisProgramStorage._safe_deserialize(raw, ctx="lineage-populated")
+        assert prog is not None
+        assert prog.lineage.parents == [parent_a, parent_b]
+        assert prog.lineage.children == [child_a]
+
 
 class TestLegacyPathUnchanged:
     async def test_default_storage_has_no_dataplane(self) -> None:

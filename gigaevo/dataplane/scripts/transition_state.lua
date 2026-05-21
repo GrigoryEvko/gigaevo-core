@@ -44,11 +44,23 @@ local STREAM_MAXLEN = 10000
 -- and ``epoch`` are advanced server-side; ``id`` identifies the blob.
 local RESERVED_PATCH_FIELDS = {state = true, epoch = true, id = true}
 
--- cjson defaults empty tables to ``[]``; force object encoding so the
--- Program blob's empty dict fields round-trip as ``{}``. Conditional
--- because some Lua VMs (test harnesses) omit the function.
-if type(cjson.encode_empty_table_as_object) == 'function' then
-    cjson.encode_empty_table_as_object(true)
+-- Lua's cjson cannot distinguish ``[]`` from ``{}`` after decode: both
+-- become empty tables, and encode picks one representation for all empty
+-- tables (Redis 7 ships cjson without ``encode_empty_table_as_object``).
+-- Program blob fields that must serialise as JSON arrays even when empty
+-- are listed here; the encoded blob is patched post-encode to restore
+-- their array form. Dict-valued empties are left as ``{}`` (the default).
+local LIST_EMPTY_PATCHES = {
+    {pattern = '"parents":{}', replacement = '"parents":[]'},
+    {pattern = '"children":{}', replacement = '"children":[]'},
+}
+
+local function fix_empty_list_fields(json_str)
+    local out = json_str
+    for _, p in ipairs(LIST_EMPTY_PATCHES) do
+        out = string.gsub(out, p.pattern, p.replacement, 1)
+    end
+    return out
 end
 
 if ARGV[1] == nil or ARGV[1] == '' then
@@ -145,7 +157,8 @@ prog.epoch = new_epoch
 -- value and application readers observe the post-transition counter.
 prog.atomic_counter = new_epoch
 
-redis.call('SET', KEYS[1], cjson.encode(prog))
+local encoded_prog = fix_empty_list_fields(cjson.encode(prog))
+redis.call('SET', KEYS[1], encoded_prog)
 redis.call('SREM', ARGV[6] .. ':status:' .. from, ARGV[1])
 redis.call('SADD', ARGV[6] .. ':status:' .. ARGV[3], ARGV[1])
 -- Status event carries both the (id/status/event) and the dp-native
@@ -161,4 +174,4 @@ redis.call('XADD', KEYS[2], 'MAXLEN', '~', STREAM_MAXLEN, '*',
            'to', ARGV[3],
            'epoch', tostring(new_epoch))
 
-return {'ok', tostring(new_epoch), cjson.encode(prog)}
+return {'ok', tostring(new_epoch), encoded_prog}

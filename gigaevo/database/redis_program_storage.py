@@ -130,6 +130,33 @@ class RedisProgramStorage(ProgramStorage):
     # path is uniform across both.
     _DICT_FIELDS: frozenset[str] = frozenset({"stage_results", "metrics", "metadata"})
 
+    # Dotted paths to ``Program`` fields that must round-trip as ``list``
+    # even when empty. cjson on real Redis cannot distinguish empty
+    # ``{}`` from empty ``[]`` after a decode/encode pass through
+    # ``transition_state.lua``; the Lua script restores list form for
+    # known fields via string substitution, and this coercion is the
+    # defense-in-depth path that upgrades any already-corrupted records.
+    _LIST_FIELDS_NESTED: tuple[tuple[str, ...], ...] = (
+        ("lineage", "parents"),
+        ("lineage", "children"),
+    )
+
+    @classmethod
+    def _coerce_nested_empty_to_list(cls, data: dict[str, Any]) -> None:
+        """In-place: coerce known nested list fields from ``{}`` to ``[]``."""
+        for path in cls._LIST_FIELDS_NESTED:
+            node: Any = data
+            for key in path[:-1]:
+                if not isinstance(node, dict):
+                    node = None
+                    break
+                node = node.get(key)
+            if not isinstance(node, dict):
+                continue
+            leaf = node.get(path[-1])
+            if isinstance(leaf, dict) and not leaf:
+                node[path[-1]] = []
+
     @classmethod
     def _safe_deserialize(
         cls,
@@ -148,6 +175,7 @@ class RedisProgramStorage(ProgramStorage):
                 for fname in cls._DICT_FIELDS:
                     if isinstance(data.get(fname), list) and not data[fname]:
                         data[fname] = {}
+                cls._coerce_nested_empty_to_list(data)
             return Program.from_dict(data, exclude=exclude)
         except Exception as e:
             logger.warning(

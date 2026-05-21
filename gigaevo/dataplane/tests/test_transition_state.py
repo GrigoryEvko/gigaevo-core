@@ -256,18 +256,19 @@ class TestSideEffects:
         assert last_fields["status"] == "RUNNING"
         assert last_fields["event"] == "transition"
 
-    async def test_lua_invokes_encode_empty_table_directive(
+    async def test_lua_preserves_list_form_for_lineage_fields(
         self, coord: dp.DataPlane
     ) -> None:
-        """Pin that the Lua source contains the cjson-empty-object guard.
+        """Pin that the Lua source rewrites known list-valued empties.
 
-        fakeredis's embedded Lua VM does not expose
-        ``cjson.encode_empty_table_as_object``, so a runtime round-trip
-        test would only check the directive's no-op path. The source-text
-        pin is the strongest verification available without a real Redis
-        instance: it asserts the directive is present at the top of the
-        script and is invoked conditionally so deployments on Redis builds
-        without the function continue to load the script.
+        Lua's cjson cannot distinguish empty ``[]`` from empty ``{}``
+        after a decode/encode round-trip; on Redis 7 the default encode
+        form for an empty table is ``{}``. The Lua script restores list
+        form for known fields (``parents``, ``children``) via post-encode
+        string substitution. fakeredis's embedded Lua VM happens to emit
+        empty tables as ``[]`` by default, so a fakeredis-only round-trip
+        test would not catch the regression; the source-text pin is the
+        strongest verification available against the in-memory fixture.
         """
         from gigaevo.dataplane.scripts import load_lua_source
 
@@ -276,16 +277,14 @@ class TestSideEffects:
                 "gigaevo.dataplane.coordinator", fromlist=["_SCRIPT_TRANSITION_STATE"]
             )._SCRIPT_TRANSITION_STATE
         )
-        assert "cjson.encode_empty_table_as_object" in source, (
-            "transition_state.lua must call cjson.encode_empty_table_as_object "
-            "so empty Lua tables encode as JSON objects rather than arrays; "
-            "without this directive, persisted dict fields round-trip to []"
+        assert "fix_empty_list_fields" in source, (
+            "transition_state.lua must run fix_empty_list_fields after "
+            "cjson.encode so persisted list-typed fields round-trip as "
+            "JSON arrays even when empty"
         )
-        # The call must be guarded so older Redis builds / fakeredis pass
-        # the script-load step.
-        assert "type(cjson.encode_empty_table_as_object) == 'function'" in source, (
-            "the directive must be guarded by a type check so script load "
-            "succeeds against Redis builds that omit the function"
+        assert '"parents":[]' in source and '"children":[]' in source, (
+            "transition_state.lua must declare the list-form replacements "
+            "for the known lineage fields"
         )
 
     async def test_atomic_counter_mirrors_epoch_in_blob(
