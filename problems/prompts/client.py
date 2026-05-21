@@ -96,8 +96,18 @@ class LLMClient:
         return self._call_logs
 
     def clear_logs(self) -> None:
-        """Clear all call logs."""
-        self._call_logs = []
+        """Empty the cost-tracking ledger in place.
+
+        Mutates ``_call_logs`` via ``list.clear()`` rather than rebinding
+        to a fresh list. The ``copy()`` contract aliases ``_call_logs`` so
+        per-call appends from copies accumulate on the parent's budget
+        ledger (see :meth:`__call__` budget guard). Rebinding would
+        silently detach every outstanding copy from the ledger:
+        post-clear appends from copies would land on a now-orphaned list
+        and the ``max_cost`` guard would observe zero new cost, bypassing
+        the budget by a factor equal to the parallel fan-out.
+        """
+        self._call_logs.clear()
 
     def _compute_cost(
         self, prompt_tokens: int, completion_tokens: int
