@@ -100,58 +100,131 @@ class TestChatOpenAIConfig:
         with pytest.raises(ValidationError):
             ChatOpenAIConfig(model="x", temperature=2.5)
 
-    def test_missing_api_key_raises_typed_error(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-        with pytest.raises(ValidationError, match="OPENAI_API_KEY"):
-            ChatOpenAIConfig(model="x")
-
-    def test_explicit_api_key_overrides_env(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-        cfg = ChatOpenAIConfig(model="x", api_key="explicit")
-        assert cfg.api_key == "explicit"
-
-    def test_kind_literal_pinned(self) -> None:
-        cfg = ChatOpenAIConfig(model="x")
-        assert cfg.kind == "chat_openai"
-
     def test_empty_model_rejected(self) -> None:
         with pytest.raises(ValidationError):
             ChatOpenAIConfig(model="")
 
-    def test_api_key_excluded_from_dump_and_repr(
+    def test_api_key_not_a_schema_field(self) -> None:
+        """The API token must not be a schema field at all: it cannot
+        leak through tyro's ``--help`` rendering, the dumped
+        ``config.json``, ``__repr__``, or the experiment-id hash, and
+        the dumped config remains self-contained across env changes."""
+        assert "api_key" not in ChatOpenAIConfig.model_fields
+        with pytest.raises(ValidationError, match="extra_forbidden"):
+            ChatOpenAIConfig(model="x", api_key="explicit")  # type: ignore[call-arg]
+
+    def test_kind_field_dropped(self) -> None:
+        """``kind`` was dead weight on this leaf schema: the
+        ``LLMConfig`` discriminated union dispatches on the
+        ``BanditRouterConfig`` / ``EnsembleRouterConfig`` ``kind``,
+        never on a nested ``ChatOpenAIConfig``."""
+        assert "kind" not in ChatOpenAIConfig.model_fields
+
+    def test_dump_carries_no_secret(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The resolved API key must not leak through serialization
-        surfaces: model_dump, model_dump_json, and __repr__. The CLI
-        writes the dumped JSON to disk as ``config.json`` and the repr
-        is used in log lines; an api_key in either is a credential
-        leak."""
+        """The dumped JSON must not contain any credential material —
+        the value of OPENAI_API_KEY at construction time must not be
+        observable from the serialised form."""
         monkeypatch.setenv("OPENAI_API_KEY", "sk-secret-DO-NOT-LEAK")
         cfg = ChatOpenAIConfig(model="x")
-        assert cfg.api_key == "sk-secret-DO-NOT-LEAK"
-        dumped = cfg.model_dump()
-        assert "api_key" not in dumped
-        dumped_json = cfg.model_dump_json()
-        assert "api_key" not in dumped_json
-        assert "sk-secret" not in dumped_json
-        assert "sk-secret" not in repr(cfg)
+        for surface in (cfg.model_dump(), cfg.model_dump_json(), repr(cfg)):
+            text = surface if isinstance(surface, str) else str(surface)
+            assert "sk-secret" not in text
+            assert "api_key" not in text
 
-    def test_api_key_round_trip_resolves_from_env(
+    def test_dump_self_contained_across_env(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A round trip through JSON drops the api_key on dump and
-        re-resolves it from the environment on load. The reloaded
-        config is functionally equivalent to the original even though
-        the on-disk JSON carries no credential."""
-        monkeypatch.setenv("OPENAI_API_KEY", "sk-round-trip-key")
+        """``dump -> unset env -> validate -> dump`` must round-trip
+        byte-identically. The dumped ``config.json`` is the
+        reproducibility record; making it depend on the runtime
+        environment defeats the reproducibility contract."""
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-original")
         cfg = ChatOpenAIConfig(model="x")
-        parsed = ChatOpenAIConfig.model_validate_json(cfg.model_dump_json())
-        assert parsed.api_key == "sk-round-trip-key"
-        assert parsed.model == cfg.model
+        dumped = cfg.model_dump_json()
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        parsed = ChatOpenAIConfig.model_validate_json(dumped)
+        assert parsed.model_dump_json() == dumped
+
+
+class TestChatOpenAIBuildSecretHandling:
+    """Secret resolution moved into ``ChatOpenAIConfig.build``; the
+    sanitiser there is the single line of defence between the env and
+    the HTTP layer."""
+
+    def _build_or_raise(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        env_value: str | None,
+        explicit: str | None = None,
+    ) -> str:
+        """Capture the ``api_key`` argument passed to the strict
+        ``ChatOpenAI`` constructor without actually instantiating it."""
+        import gigaevo.llm.strict_chat_openai as scoa
+
+        captured: dict[str, str] = {}
+
+        def _fake(*_args: object, **kwargs: object) -> object:
+            captured["api_key"] = kwargs["api_key"]  # type: ignore[assignment]
+            return object()
+
+        monkeypatch.setattr(scoa, "strict_chat_openai", _fake)
+        if env_value is None:
+            monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        else:
+            monkeypatch.setenv("OPENAI_API_KEY", env_value)
+        cfg = ChatOpenAIConfig(model="x")
+        cfg.build(api_key=explicit)
+        return captured["api_key"]
+
+    def test_env_key_passthrough(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        assert self._build_or_raise(monkeypatch, "sk-from-env") == "sk-from-env"
+
+    def test_explicit_argument_overrides_env(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        resolved = self._build_or_raise(
+            monkeypatch, "sk-from-env", explicit="sk-explicit"
+        )
+        assert resolved == "sk-explicit"
+
+    def test_missing_env_rejected_at_build(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        cfg = ChatOpenAIConfig(model="x")
+        with pytest.raises(ValueError, match="OPENAI_API_KEY"):
+            cfg.build()
+
+    def test_whitespace_only_env_rejected(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("OPENAI_API_KEY", "   ")
+        cfg = ChatOpenAIConfig(model="x")
+        with pytest.raises(
+            ValueError, match="at least one non-whitespace character"
+        ):
+            cfg.build()
+
+    def test_ansi_escape_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-\x1b[31mred\x1b[0m")
+        cfg = ChatOpenAIConfig(model="x")
+        with pytest.raises(ValueError, match="control character"):
+            cfg.build()
+
+    def test_nul_byte_rejected_via_explicit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cfg = ChatOpenAIConfig(model="x")
+        with pytest.raises(ValueError, match="NUL"):
+            cfg.build(api_key="sk-with-\x00-nul")
+
+    def test_surrounding_whitespace_stripped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        resolved = self._build_or_raise(monkeypatch, "  sk-padded  ")
+        assert resolved == "sk-padded"
 
 
 class TestBanditRouterConfig:
@@ -175,6 +248,20 @@ class TestEnsembleRouterConfig:
         m = ChatOpenAIConfig(model="x")
         with pytest.raises(ValidationError, match="positive"):
             EnsembleRouterConfig(models=[m, m], probabilities=[1.0, -0.1])
+
+    def test_nan_probability_rejected(self) -> None:
+        m = ChatOpenAIConfig(model="x")
+        with pytest.raises(ValidationError, match="finite"):
+            EnsembleRouterConfig(
+                models=[m, m], probabilities=[float("nan"), 0.5]
+            )
+
+    def test_inf_probability_rejected(self) -> None:
+        m = ChatOpenAIConfig(model="x")
+        with pytest.raises(ValidationError, match="finite"):
+            EnsembleRouterConfig(
+                models=[m, m], probabilities=[float("inf"), 0.5]
+            )
 
     def test_no_probabilities_means_uniform_at_runtime(self) -> None:
         m = ChatOpenAIConfig(model="x")

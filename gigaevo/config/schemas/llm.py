@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import math
 import os
+import unicodedata
 from typing import TYPE_CHECKING, Annotated, Literal
 
 from pydantic import Field, model_validator
@@ -14,33 +16,57 @@ if TYPE_CHECKING:
     from gigaevo.utils.trackers.base import LogWriter
 
 
+_OPENAI_API_KEY_ENV: str = "OPENAI_API_KEY"
+
+
+def _sanitize_secret(value: str | None, source: str) -> str:
+    """Return the secret stripped of surrounding whitespace, rejecting
+    NUL bytes and any unicode general-category-Cc control codepoint.
+
+    OpenAI-style API keys are pure printable ASCII; a NUL slipped in
+    through an ``.env`` file truncates the key at the C boundary on
+    some HTTP stacks, a wrapping ESC sequence ends up in log lines,
+    and stray whitespace silently authenticates as the wrong tenant.
+    Rejecting them at schema-load time turns a runtime auth failure
+    into a typed error frame.
+    """
+    if value is None:
+        raise ValueError(
+            f"{source} must be set; got no value from explicit api_key or "
+            f"the {_OPENAI_API_KEY_ENV} environment variable"
+        )
+    stripped = value.strip()
+    if not stripped:
+        raise ValueError(
+            f"{source} must contain at least one non-whitespace character"
+        )
+    for ch in stripped:
+        if ch == "\x00":
+            raise ValueError(f"{source} contains a NUL byte and is rejected")
+        if unicodedata.category(ch) == "Cc":
+            raise ValueError(
+                f"{source} contains control character U+{ord(ch):04X} "
+                "and is rejected"
+            )
+    return stripped
+
+
 class ChatOpenAIConfig(FrozenStrictModel):
     """Single LLM endpoint configured for OpenAI-compatible servers.
 
     Field names mirror the ``ChatOpenAI`` constructor surface validated
-    by :func:`strict_chat_openai`. ``api_key`` defaults to the runtime
-    ``OPENAI_API_KEY`` environment variable; the after-validator refuses
-    a ``None`` resolution with a typed error rather than letting the
-    request reach the OpenAI HTTP boundary.
-
-    ``api_key`` is excluded from ``__repr__`` and from ``model_dump``
-    so the secret never lands in the dumped ``config.json``, in
-    experiment-id hashes, or in log lines. The default factory re-reads
-    ``OPENAI_API_KEY`` on every load, so a round trip through JSON
-    pulls the current ambient key rather than the one captured at the
-    time of the original construction.
+    by :func:`strict_chat_openai`. The API token is **not** a schema
+    field: it is resolved inside :meth:`build` from an explicit
+    ``api_key`` argument or from ``OPENAI_API_KEY``. Keeping the token
+    off the schema means it cannot leak through tyro's ``--help``
+    rendering, the dumped ``config.json``, ``__repr__``, or the
+    ``experiment_id`` hash, and ``model_validate_json`` can re-hydrate
+    a dumped config without the runtime environment.
     """
 
-    kind: Literal["chat_openai"] = "chat_openai"
     model: str = Field(
         min_length=1,
         description="Model identifier accepted by the OpenAI-compatible endpoint.",
-    )
-    api_key: str | None = Field(
-        default_factory=lambda: os.environ.get("OPENAI_API_KEY"),
-        repr=False,
-        exclude=True,
-        description="API token; defaults to OPENAI_API_KEY at construction time, omitted from dumps.",
     )
     base_url: str | None = Field(
         default=None,
@@ -63,21 +89,26 @@ class ChatOpenAIConfig(FrozenStrictModel):
         description="HTTP request timeout in seconds.",
     )
 
-    @model_validator(mode="after")
-    def require_api_key(self) -> ChatOpenAIConfig:
-        if not self.api_key:
-            raise ValueError(
-                "OPENAI_API_KEY environment variable must be set, or "
-                "api_key passed explicitly on ChatOpenAIConfig"
-            )
-        return self
+    def build(self, *, api_key: str | None = None) -> ChatOpenAI:
+        """Resolve the API token then construct the runtime client.
 
-    def build(self) -> ChatOpenAI:
+        Resolution order: explicit ``api_key`` argument, then
+        ``OPENAI_API_KEY``. The resolved value is sanitised by
+        :func:`_sanitize_secret` — whitespace stripped, NUL and control
+        characters rejected — before reaching the HTTP layer.
+        """
         from gigaevo.llm.strict_chat_openai import strict_chat_openai
 
+        if api_key is not None:
+            resolved = _sanitize_secret(api_key, source="api_key argument")
+        else:
+            env_value = os.environ.get(_OPENAI_API_KEY_ENV)
+            resolved = _sanitize_secret(
+                env_value, source=f"{_OPENAI_API_KEY_ENV} environment variable"
+            )
         return strict_chat_openai(
             model=self.model,
-            api_key=self.api_key,
+            api_key=resolved,
             base_url=self.base_url,
             temperature=self.temperature,
             max_tokens=self.max_tokens,
@@ -158,8 +189,8 @@ class EnsembleRouterConfig(FrozenStrictModel):
 
     When ``probabilities`` is ``None`` the runtime applies a uniform
     distribution over ``models``. When provided, the after-validator
-    enforces length parity and positivity; the runtime normalises the
-    weights to a probability distribution.
+    enforces length parity, finiteness and positivity; the runtime
+    normalises the weights to a probability distribution.
     """
 
     kind: Literal["ensemble"] = "ensemble"
@@ -194,8 +225,13 @@ class EnsembleRouterConfig(FrozenStrictModel):
                 f"probabilities length ({len(self.probabilities)}) "
                 f"must equal models length ({len(self.models)})"
             )
-        if any(p <= 0 for p in self.probabilities):
-            raise ValueError("all probabilities must be positive")
+        # ``p > 0`` alone admits ``float('inf')`` and ``float('nan')``;
+        # the downstream normaliser would divide by ``sum(...)`` and
+        # propagate the non-finite value into the runtime sampler.
+        if any(not math.isfinite(p) or p <= 0 for p in self.probabilities):
+            raise ValueError(
+                "all probabilities must be finite and strictly positive"
+            )
         return self
 
     def build(self, *, writer: LogWriter | None = None) -> Runnable:
