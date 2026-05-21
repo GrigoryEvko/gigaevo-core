@@ -1,5 +1,20 @@
 import numpy as np
 
+# Trivial decomposition bound for the (n, m, p) = (2, 4, 5) matmul tensor:
+# the standard rank-n*m*p = 40 outer-product expansion always works, so
+# any candidate that claims more rank-1 terms than that is strictly
+# worse than the textbook construction and reserves no novel signal.
+# Bounding the rank also keeps the einsum below at a fixed cost so
+# adversarial inputs cannot inflate the validator's wallclock.
+_MAX_RANK = 40
+
+# Tensor-equality tolerance. The reference tensor has 0/1 entries and
+# the einsum reconstruction goes through BLAS, so bit-exact equality
+# (``np.array_equal``) rejects algebraically valid decompositions
+# whose only error is sub-ULP rounding. The problem description
+# documents a 1e-6 tolerance for matmul tensor reconstruction.
+_TENSOR_ATOL = 1e-6
+
 
 def validate(result):
     if not isinstance(result, dict):
@@ -19,6 +34,13 @@ def validate(result):
 
     if not isinstance(rank, (int, np.integer)) or rank <= 0:
         raise ValueError(f"Rank must be a positive integer, got {rank}")
+    if rank > _MAX_RANK:
+        raise ValueError(
+            f"Rank {rank} exceeds trivial upper bound {_MAX_RANK} "
+            f"(n*m*p = {n * m * p}); the textbook decomposition is "
+            "already at most that rank, so higher ranks are not novel "
+            "and would let adversarial inputs inflate validator cost."
+        )
 
     if u_vectors.ndim != 2 or u_vectors.shape[1] != n * m:
         raise ValueError(
@@ -63,10 +85,12 @@ def validate(result):
         "ir,jr,kr -> ijk", u_reshaped, v_reshaped, w_reshaped
     )
 
-    if not np.array_equal(constructed_tensor, matmul_tensor):
-        diff = np.max(np.abs(constructed_tensor - matmul_tensor))
+    diff = float(np.max(np.abs(constructed_tensor - matmul_tensor)))
+    if diff > _TENSOR_ATOL:
         raise ValueError(
-            f"Tensor constructed by decomposition does not exactly match the target tensor. Maximum difference is {diff:.6e}."
+            f"Tensor constructed by decomposition does not match the "
+            f"target tensor within atol={_TENSOR_ATOL:g}. "
+            f"Maximum difference is {diff:.6e}."
         )
 
     BENCHMARK = 32
