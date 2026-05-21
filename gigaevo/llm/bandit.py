@@ -829,7 +829,12 @@ class BanditModelRouter(MultiModelRouter):
     # -- structured output --------------------------------------------------
 
     def with_structured_output(self, schema: Any, **kwargs) -> _StructuredOutputRouter:
-        """Create a structured-output router that delegates selection to the bandit."""
+        """Create a structured-output router that delegates selection to the bandit.
+
+        Schema is forwarded both to the underlying ``ChatOpenAI`` wrappers
+        and to ``_StructuredOutputRouter`` so the tolerant re-parse path
+        can recover fence-wrapped JSON without re-issuing the call.
+        """
         wrapped = [
             m.with_structured_output(schema, include_raw=True, **kwargs)
             for m in self.models
@@ -857,4 +862,5 @@ class BanditModelRouter(MultiModelRouter):
             task_model_map=self._task_model_map,
             select_override=_bandit_select,
             failure_hook=self._inject_failure_reward,
+            schema=schema,
         )

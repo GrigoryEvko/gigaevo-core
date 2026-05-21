@@ -5,6 +5,7 @@ from collections.abc import AsyncIterator, Callable, Iterator
 from contextvars import ContextVar
 import os
 import random
+import re
 import threading
 import time
 from typing import TYPE_CHECKING, Any, cast
@@ -16,6 +17,7 @@ from langchain_core.runnables import Runnable, RunnableConfig
 from langchain_openai import ChatOpenAI
 from langfuse.langchain import CallbackHandler
 from loguru import logger
+from pydantic import BaseModel, ValidationError
 
 from gigaevo.llm.token_tracking import TokenTracker
 from gigaevo.utils.text_sanitize import clean_identifier, sanitize_for_log
@@ -26,6 +28,32 @@ if TYPE_CHECKING:
 
 
 _selected_model_var: ContextVar[str | None] = ContextVar("selected_model", default=None)
+
+
+# Match an outer markdown code fence — optional language tag (``json``,
+# ``JSON``, ``yaml`` …), surrounding newlines / whitespace, and a trailing
+# closing fence. Sonnet / Gemini routinely wrap structured replies in
+# fences even under ``response_format=json_object``; stripping them lets a
+# subsequent ``model_validate_json`` succeed without re-issuing the call.
+_MARKDOWN_FENCE_PATTERN = re.compile(
+    r"^\s*```(?:[a-zA-Z0-9_-]+)?\s*\n?(?P<body>.*?)\n?```\s*$",
+    re.DOTALL,
+)
+
+
+def _strip_markdown_fences(text: str) -> str:
+    """Return ``text`` with one outer markdown code fence removed.
+
+    Idempotent: input without a fence pair is returned verbatim. Only the
+    outermost fence is stripped — nested fences inside the JSON body (a
+    string literal containing triple-backticks, for example) survive.
+    """
+    if not isinstance(text, str):
+        return text
+    match = _MARKDOWN_FENCE_PATTERN.match(text)
+    if match is None:
+        return text
+    return match.group("body")
 
 
 def _redact_url(url: str) -> str:
@@ -410,7 +438,13 @@ class MultiModelRouter(Runnable):
             self._tracker.track(last, name)
 
     def with_structured_output(self, schema: Any, **kwargs) -> _StructuredOutputRouter:
-        """Create a router that returns parsed Pydantic models with token tracking."""
+        """Create a router that returns parsed Pydantic models with token tracking.
+
+        ``schema`` is forwarded to the underlying ``ChatOpenAI`` wrappers
+        *and* retained on the resulting router so the fallback parser can
+        re-validate a fence-stripped payload on a ``parsing_error``
+        without re-issuing the LLM call.
+        """
         wrapped = [
             m.with_structured_output(schema, include_raw=True, **kwargs)
             for m in self.models
@@ -422,6 +456,7 @@ class MultiModelRouter(Runnable):
             self._langfuse,
             self._tracker,
             task_model_map=self._task_model_map,
+            schema=schema,
         )
 
 
@@ -438,6 +473,7 @@ class _StructuredOutputRouter(Runnable):
         task_model_map: dict[int, str] | None = None,
         select_override: Callable[[], tuple[Any, str]] | None = None,
         failure_hook: Callable[[BaseException, str], None] | None = None,
+        schema: Any | None = None,
     ):
         self._models = models
         self._names = model_names
@@ -452,6 +488,11 @@ class _StructuredOutputRouter(Runnable):
         # entry. The hook receives the exception and the selected arm name;
         # it must not re-raise (the original exception still propagates).
         self._failure_hook = failure_hook
+        # Retained so ``_process`` can re-validate a fence-stripped payload
+        # against the original Pydantic schema when langchain surfaces a
+        # ``parsing_error``. ``None`` for dict / TypedDict schemas — the
+        # fallback parser is skipped in that case.
+        self._schema = schema
 
     def _select(self) -> tuple[Any, str]:
         if self._select_override is not None:
@@ -476,16 +517,70 @@ class _StructuredOutputRouter(Runnable):
         parsing_error = response.get("parsing_error")
         parsed = response.get("parsed")
         if parsing_error is not None and parsed is None:
-            # ``include_raw=True`` makes langchain surface schema-validation
-            # failures as ``response['parsing_error']`` with ``parsed=None``
-            # instead of raising. Returning ``None`` here would silently
-            # bypass the caller's ``try / except`` and the bandit's
-            # failure_hook would never fire — the pull was recorded by
-            # ``_select`` but the reward window would never get a matching
-            # entry. Raise the parsing_error so the call site routes it
-            # through the existing failure path.
+            # langchain's ``include_raw=True`` surfaces schema-validation
+            # failures as ``response['parsing_error']`` with ``parsed=None``.
+            # Sonnet / Gemini frequently wrap structured replies in markdown
+            # fences (``` ```json …``` ```) even under ``response_format``
+            # contracts; the inner parser then chokes on the fence chars.
+            # Try a tolerant re-parse against the schema before treating
+            # the call as a genuine failure.
+            recovered = self._recover_from_parsing_error(raw)
+            if recovered is not None:
+                return recovered
+            # Returning ``None`` here would silently bypass the caller's
+            # ``try / except`` and the bandit's failure_hook would never
+            # fire — the pull was recorded by ``_select`` but the reward
+            # window would never get a matching entry. Raise the
+            # parsing_error so the call site routes it through the
+            # existing failure path.
             raise parsing_error
         return parsed
+
+    def _recover_from_parsing_error(self, raw: Any) -> Any:
+        """Best-effort re-validate ``raw`` content against ``self._schema``.
+
+        Returns the parsed model on success, ``None`` when the schema is
+        unknown, the raw payload is not a string-bearing message, or
+        re-validation fails. The caller treats ``None`` as "no recovery
+        possible" and raises the original ``parsing_error``.
+        """
+        if self._schema is None or not isinstance(self._schema, type):
+            return None
+        if not issubclass(self._schema, BaseModel):
+            return None
+        text = self._extract_text(raw)
+        if not text:
+            return None
+        stripped = _strip_markdown_fences(text)
+        if stripped == text:
+            return None
+        try:
+            return self._schema.model_validate_json(stripped)
+        except ValidationError:
+            return None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _extract_text(raw: Any) -> str | None:
+        """Return the string content of a langchain message-like ``raw``.
+
+        Handles the common shapes: ``BaseMessage`` (``.content`` attr),
+        ``dict`` envelopes (``content`` / ``text`` keys), and bare strings.
+        """
+        if raw is None:
+            return None
+        if isinstance(raw, str):
+            return raw
+        content = getattr(raw, "content", None)
+        if isinstance(content, str):
+            return content
+        if isinstance(raw, dict):
+            for key in ("content", "text"):
+                value = raw.get(key)
+                if isinstance(value, str):
+                    return value
+        return None
 
     def invoke(
         self, input: LanguageModelInput, config: RunnableConfig | None = None, **kwargs
