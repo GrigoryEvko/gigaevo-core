@@ -436,6 +436,34 @@ class TestDataplaneSwapPath:
         added = await dp_archive.add_elite((0,), p, selector)
         assert added is False
 
+    async def test_archive_writes_to_archive_prefix_not_dataplane_prefix(
+        self, shared_server, dp_storage, coord
+    ):
+        """When archive prefix differs from dataplane prefix, the swap
+        must land on ``{archive_prefix}:archive`` — not the dataplane's
+        own ``key_prefix``. The dataplane is engine-wide; per-island
+        archive storages own their own hash namespace, so a mismatch
+        between read-side ``_hash_key`` and write-side ``archive_key``
+        silently no-ops every multi-generation MAP-Elites run.
+        """
+        archive = RedisArchiveStorage(
+            dp_storage, key_prefix="island_42", dataplane=coord
+        )
+        p = _prog(metrics={"score": 5.0})
+        await dp_storage.add(p)
+        selector = SumArchiveSelector(fitness_keys=["score"])
+        added = await archive.add_elite((0,), p, selector)
+        assert added is True
+
+        elite = await archive.get_elite((0,))
+        assert elite is not None and elite.id == p.id
+
+        # The write must land on the archive's own prefix, not on the
+        # dataplane's global ``test`` prefix.
+        pool = coord._connection.pool  # type: ignore[attr-defined]
+        assert (await pool.hget("island_42:archive", "0")) == p.id
+        assert (await pool.hget("test:archive", "0")) is None
+
     async def test_nan_score_falls_back_to_watch(self, dp_storage, dp_archive):
         """A NaN scalar must not reach the Lua boundary; the helper
         treats it as non-reducible and the WATCH path takes over."""

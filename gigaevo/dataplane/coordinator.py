@@ -995,6 +995,7 @@ class DataPlane:
         token: Token[CellKey],
         candidate_score: float,
         tiebreak_bit: int,
+        key_prefix: str | None = None,
         deadline_monotonic: float | None = None,
     ) -> Result[EliteSwapOutcome, DataPlaneError]:
         """Atomic archive cell swap.
@@ -1013,6 +1014,13 @@ class DataPlane:
         equal-score programs should rotate), ``0`` means the occupant
         wins ties (favours stability — useful when equal-score programs
         should be left undisturbed).
+
+        ``key_prefix`` overrides the coordinator's default
+        ``connection.key_prefix`` so per-island archive storages can
+        target their own ``{island_prefix}:archive`` keys instead of
+        colliding on a single engine-wide hash. Required for the
+        :class:`RedisArchiveStorage` swap path because the archive
+        keys are constructed independently of the dataplane.
         """
         self._validate_key_component(
             cell, method="try_replace_elite", field_name="cell"
@@ -1044,7 +1052,10 @@ class DataPlane:
                     f"try_replace_elite: token tag {tag!r} does not match cell {cell!r}"
                 )
             )
-        prefix = self._connection.key_prefix
+        prefix = key_prefix if key_prefix is not None else self._connection.key_prefix
+        self._validate_key_component(
+            prefix, method="try_replace_elite", field_name="key_prefix"
+        )
         archive_key = f"{prefix}:archive"
         reverse_key = f"{prefix}:archive:reverse"
         scores_key = f"{prefix}:archive:scores"

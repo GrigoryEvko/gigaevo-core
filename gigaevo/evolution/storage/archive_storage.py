@@ -149,6 +149,7 @@ class RedisArchiveStorage(ArchiveStorage):
     ) -> None:
         self._storage = program_storage
         prefix = key_prefix or program_storage.config.key_prefix
+        self._key_prefix = prefix
         self._hash_key = f"{prefix}:archive"
         self._reverse_key = f"{prefix}:archive:reverse"
         self._dataplane = dataplane
@@ -304,6 +305,7 @@ class RedisArchiveStorage(ArchiveStorage):
             token=token,
             candidate_score=score,
             tiebreak_bit=_DEFAULT_TIEBREAK_BIT,
+            key_prefix=self._key_prefix,
         )
         if isinstance(result, Err):
             logger.warning(

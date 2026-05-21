@@ -263,8 +263,9 @@ def wire_archive_storage(
     archive._dataplane = dataplane
     archive._engine_root = engine_root
     logger.info(
-        "RedisArchiveStorage wired to DataPlane: hash_key={}",
-        archive._hash_key,
+        "RedisArchiveStorage wired to DataPlane: archive_prefix={} dataplane_prefix={}",
+        archive._key_prefix,
+        dataplane.key_prefix,
     )
     return True
 
