@@ -692,9 +692,7 @@ class TestSearchFallbackPaths:
         # dedupe_keep_order, so existing is safe here too.
 
     def test_parse_llm_card_decision_returns_none_for_garbage(self):
-        """FIXED: parse_llm_card_decision returns None for garbage input,
-        enabling the retry loop in _decide_card_action to work correctly.
-        """
+        """parse_llm_card_decision returns None for unparseable LLM output."""
         from gigaevo.memory.shared_memory.card_update_dedup import (
             parse_llm_card_decision,
         )
@@ -736,6 +734,5 @@ class TestSearchFallbackPaths:
 
         client = make_mocked_client(handler, base_url="http://test:8000")
 
-        # BUG: raises json.JSONDecodeError, not RuntimeError
-        with pytest.raises(Exception):  # JSONDecodeError or RuntimeError
+        with pytest.raises(_json.JSONDecodeError):
             client.get_concept("eid-1")

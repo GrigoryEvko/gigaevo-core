@@ -1,236 +1,195 @@
+"""Typed entry point for the evolutionary search runtime.
+
+The CLI is intentionally thin: explicit construction with no decorator
+magic, no chdir, no module singletons. Configuration loads through
+:func:`build_experiment` (Pydantic-validated), CLI overrides apply via
+tyro (auto-generated from the model field tree), the resolved config
+dumps to JSON for reproducibility, and the typed object graph is
+handed to :func:`gigaevo.config.object_graph.run_with_config`.
+"""
+
+from __future__ import annotations
+
+import argparse
 import asyncio
+import contextlib
+import os
 from pathlib import Path
-import time
-from typing import Any
+import sys
+import tempfile
 
 from dotenv import load_dotenv
-import hydra
-from hydra.utils import instantiate
 from loguru import logger
-from omegaconf import DictConfig
 
-from gigaevo.config.resolvers import register_resolvers
-from gigaevo.database.redis_program_storage import RedisProgramStorage
-from gigaevo.dataplane import (
-    DataPlane,
-    build_actor_identity,
-    build_dataplane,
-    build_engine_root,
-    wire_archive_storage,
-    wire_bandit_router,
-    wire_dag_runner,
-    wire_evolution_engine,
-    wire_prompt_fetcher,
-    wire_storage,
-)
-from gigaevo.evolution.engine import EvolutionEngine
-from gigaevo.problems.initial_loaders import InitialProgramLoader
-from gigaevo.programs.stages.python_executors.wrapper import (
-    WorkerPool,
-    default_exec_runner_pool,
-    reset_ambient_exec_runner_pool,
-    set_ambient_exec_runner_pool,
-)
-from gigaevo.runner.dag_runner import DagRunner
-from gigaevo.utils.logger_setup import setup_logger
-from gigaevo.utils.serve import serve_until_signal
-from gigaevo.utils.trackers.base import LogWriter
+from gigaevo.config.experiment_loader import build_experiment
+from gigaevo.config.schemas.experiment import ExperimentConfig
 
 
-async def run_experiment(cfg: DictConfig) -> None:
-    start_time = time.time()
-    logger.info("GigaEvo — Problem: {}", cfg.problem.name)
+def _build_initial_parser() -> argparse.ArgumentParser:
+    """Build the argparse layer that owns the experiment-path positional
+    and the ``--dry-run`` switch. ``add_help`` stays off so a trailing
+    ``--help`` after the experiment path reaches the tyro layer and
+    prints the typed-override field tree."""
+    parser = argparse.ArgumentParser(
+        prog="gigaevo",
+        description="Evolutionary search runtime — typed entry point",
+        add_help=False,
+    )
+    parser.add_argument(
+        "experiment",
+        nargs="?",
+        type=Path,
+        help="Path to an experiment Python file that exports build() -> ExperimentConfig",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Load, validate, and dump the resolved config without invoking the engine",
+    )
+    parser.add_argument(
+        "-h",
+        "--help",
+        dest="help",
+        action="store_true",
+        help="Print this help; with an experiment argument, also print the tyro field tree",
+    )
+    return parser
 
-    redis_storage: RedisProgramStorage | None = None
-    writer: LogWriter | None = None
-    dataplane: DataPlane | None = None
-    prompt_dataplane: DataPlane | None = None
-    dag_runner: DagRunner | None = None
-    evolution_engine: EvolutionEngine | None = None
-    program_loader: InitialProgramLoader | None = None
-    config_with_instances: Any | None = None
 
-    # Ambient pool: ``run_exec_runner(pool=None)`` resolves to this pool
-    # for the lifetime of the run, amortizing subprocess startup.
-    exec_runner_pool: WorkerPool = default_exec_runner_pool()
-    pool_token = set_ambient_exec_runner_pool(exec_runner_pool)
+def _parse_initial_args(
+    argv: list[str],
+) -> tuple[Path | None, bool, bool, list[str]]:
+    """Parse the experiment-path + dry-run prefix; forward the remainder
+    to tyro for nested field overrides.
+
+    Returns ``(experiment_path, dry_run, help_requested, overrides)``.
+    """
+    parser = _build_initial_parser()
+    parsed, overrides = parser.parse_known_args(argv)
+    return parsed.experiment, parsed.dry_run, parsed.help, overrides
+
+
+def _apply_tyro_overrides(
+    baseline: ExperimentConfig, override_args: list[str]
+) -> ExperimentConfig:
+    """Apply ``--key value`` overrides via tyro, re-running every Pydantic
+    validator against the merged configuration."""
+    if not override_args:
+        return baseline
+
+    import tyro
+
+    return tyro.cli(
+        ExperimentConfig,
+        default=baseline,
+        args=override_args,
+        prog="gigaevo overrides",
+    )
+
+
+def _dump_resolved_config(cfg: ExperimentConfig) -> Path:
+    """Write ``config.json`` under ``output_dir/experiment_id`` and
+    return the absolute path. The dump is the reproducibility record:
+    given identical inputs, two runs share an output directory.
+
+    Two concurrent sweep workers can resolve to the same
+    ``experiment_id`` (overrides that don't affect the hashed fields).
+    The write is performed via ``tempfile.NamedTemporaryFile`` +
+    ``os.replace`` so a half-written ``config.json`` is never visible
+    to a peer reader and last-writer-wins semantics hold without data
+    corruption.
+    """
+    out_dir = (cfg.output_dir / cfg.experiment_id).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    config_path = out_dir / "config.json"
+    payload = cfg.model_dump_json(indent=2)
+    tmp_path: Path | None = None
     try:
-        try:
-            config_with_instances = instantiate(cfg, recursive=True)
-        except Exception:
-            logger.exception("Hydra instantiation failed")
-            raise
-
-        redis_storage = config_with_instances.redis_storage
-        program_loader = config_with_instances.program_loader
-        dag_runner = config_with_instances.dag_runner
-        evolution_engine = config_with_instances.evolution_engine
-        writer = config_with_instances.writer
-
-        logger.info(
-            "Redis DB {db} at {host}:{port} | pipeline={pipeline}",
-            db=cfg.redis.db,
-            host=cfg.redis.host,
-            port=cfg.redis.port,
-            pipeline=cfg.get("pipeline_builder", {}).get("_target_", "(default)"),
-        )
-
-        # Build the coordinator from the already-instantiated storage's
-        # connection info; ``build_dataplane`` opens the connection pool,
-        # loads Lua scripts, and primes the FSM table.
-        dataplane = await build_dataplane(
-            str(redis_storage.config.redis_url),
-            key_prefix=redis_storage.config.key_prefix,
-        )
-        # Single engine root: per-call FSM tokens derive by linear split
-        # from this origin, so every per-program write is a child of the
-        # engine's ProgramId subspace witness.
-        engine_root = build_engine_root()
-        wire_storage(redis_storage, dataplane, engine_root)
-        wire_dag_runner(dag_runner, dataplane, engine_root)
-        wire_evolution_engine(evolution_engine, dataplane, engine_root)
-        # Wire archive cells for any strategy that exposes ``.islands``;
-        # strategies without islands skip the loop cleanly.
-        strategy = getattr(evolution_engine, "strategy", None)
-        islands = getattr(strategy, "islands", None) if strategy is not None else None
-        if islands is not None:
-            for island in islands.values():
-                archive = getattr(island, "archive_storage", None)
-                if archive is not None:
-                    wire_archive_storage(archive, dataplane, engine_root)
-        actor = build_actor_identity(run_id=cfg.get("run_id"))
-        llm_wrapper = getattr(evolution_engine.mutation_operator, "llm_wrapper", None)
-        if llm_wrapper is not None:
-            wire_bandit_router(llm_wrapper, dataplane, actor, engine_root)
-
-        # Prompt-outcome counters share the engine's DataPlane; the
-        # co-evolved prompt archive lives in a different Redis DB so it
-        # gets its own DataPlane dialled at the fetcher's URL.
-        prompt_fetcher = getattr(
-            evolution_engine.mutation_operator, "_prompt_fetcher", None
-        )
-        from gigaevo.prompts.fetcher import GigaEvoArchivePromptFetcher
-
-        if isinstance(prompt_fetcher, GigaEvoArchivePromptFetcher):
-            prompt_url = (
-                f"redis://{prompt_fetcher._host}:{prompt_fetcher._port}/"
-                f"{prompt_fetcher._prompt_redis_db}"
-            )
-            prompt_dataplane = await build_dataplane(
-                prompt_url,
-                key_prefix=prompt_fetcher._prompt_prefix,
-            )
-            wire_prompt_fetcher(prompt_fetcher, dataplane, prompt_dataplane, actor)
-
-        await redis_storage.acquire_instance_lock()
-
-        has_data = await redis_storage.has_data()
-        resume = cfg.redis.get("resume", False)
-
-        if has_data and not resume:
-            raise RuntimeError(
-                f"Redis database {cfg.redis.db} is not empty. "
-                f"Flush with: redis-cli -h {cfg.redis.host} -p {cfg.redis.port} "
-                f"-n {cfg.redis.db} FLUSHDB  — or set redis.resume=true"
-            )
-
-        if has_data and resume:
-            recovered = await redis_storage.recover_stranded_programs()
-            if recovered:
-                logger.info("Recovered {} stranded RUNNING program(s)", recovered)
-            await evolution_engine.restore_state()
-            await evolution_engine.strategy.restore_state()
-            logger.info(
-                "Resumed with {} existing programs",
-                await redis_storage.size(),
-            )
-        else:
-            programs = await program_loader.load(redis_storage)
-            logger.info("Loaded {} initial programs", len(programs))
-
-        try:
-            dag_runner.start()
-            evolution_engine.start()
-            logger.info(
-                "Evolution running (max_gen={})", cfg.max_generations or "unlimited"
-            )
-
-            await serve_until_signal(
-                stop_coros=(evolution_engine.stop(), dag_runner.stop()),
-                on_stop=(evolution_engine.task, dag_runner.task),
-            )
-        finally:
-            # Idempotent stops: covers the path where something between
-            # ``start()`` and ``serve_until_signal`` raises and leaves
-            # the tasks alive. ``stop()`` on an already-stopped component
-            # is a no-op.
-            try:
-                await evolution_engine.stop()
-            except Exception:
-                logger.exception("EvolutionEngine.stop failed")
-            try:
-                await dag_runner.stop()
-            except Exception:
-                logger.exception("DagRunner.stop failed")
-
-    except KeyboardInterrupt:
-        logger.info("Interrupted by user")
-    except Exception:
-        logger.exception("Experiment failed")
-        raise
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=out_dir,
+            prefix=".config.",
+            suffix=".json.tmp",
+            delete=False,
+        ) as tmp:
+            tmp_path = Path(tmp.name)
+            tmp.write(payload)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        os.replace(tmp_path, config_path)
+        tmp_path = None
     finally:
-        # Drain pool workers before unbinding the contextvar so late
-        # ``run_exec_runner`` calls during shutdown still resolve to
-        # the shared pool.
-        try:
-            await exec_runner_pool.shutdown()
-        except Exception:
-            logger.exception("WorkerPool shutdown failed")
-        reset_ambient_exec_runner_pool(pool_token)
-        if redis_storage is not None:
-            try:
-                await redis_storage.close()
-            except Exception:
-                logger.exception("RedisProgramStorage close failed")
-        # Shut the coordinator down after the storage so any tail writes
-        # storage performs during ``close()`` still see a live pool.
-        if dataplane is not None:
-            try:
-                await dataplane.shutdown()
-            except Exception:
-                logger.exception("DataPlane shutdown failed")
-        # Prompt-archive coordinator uses its own pool; ordering vs
-        # ``dataplane`` is independent.
-        if prompt_dataplane is not None:
-            try:
-                await prompt_dataplane.shutdown()
-            except Exception:
-                logger.exception("Prompt DataPlane shutdown failed")
-        if writer is not None:
-            try:
-                writer.close()
-            except Exception:
-                logger.exception("LogWriter close failed")
-        duration = time.time() - start_time
-        logger.info("Duration: {:.1f}s ({:.2f}h)", duration, duration / 3600)
-
-
-@hydra.main(version_base=None, config_path="config", config_name="config")
-def main(cfg: DictConfig) -> None:
-    load_dotenv()
-    log_file_path = setup_logger(
-        log_dir=cfg.logging.log_dir,
-        level=cfg.logging.level,
-        rotation=cfg.logging.rotation,
-        retention=cfg.logging.retention,
-    )
-    hydra_config = hydra.core.hydra_config.HydraConfig.get().runtime
+        # On any failure between tempfile creation and replace, the
+        # ``.config.*.tmp`` entry would otherwise accumulate in the
+        # output directory across retries.
+        if tmp_path is not None:
+            with contextlib.suppress(FileNotFoundError):
+                tmp_path.unlink()
     logger.info(
-        "Output dir: {} | Log: {}", Path(hydra_config.output_dir), log_file_path
+        "Resolved config dumped to {} (experiment_id={})",
+        config_path,
+        cfg.experiment_id,
     )
-    asyncio.run(run_experiment(cfg))
+    return config_path
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entry point. Returns a process exit code so the function is
+    usable from both a script entry and from in-process integration
+    tests that want to assert exit semantics."""
+    if argv is None:
+        argv = sys.argv[1:]
+
+    experiment_path, dry_run, help_requested, override_args = _parse_initial_args(
+        argv
+    )
+
+    if help_requested and experiment_path is None:
+        _build_initial_parser().print_help()
+        return 0
+
+    if experiment_path is None:
+        _build_initial_parser().print_usage(sys.stderr)
+        print(
+            "gigaevo: error: the following arguments are required: experiment",
+            file=sys.stderr,
+        )
+        return 2
+
+    load_dotenv()
+
+    baseline = build_experiment(experiment_path)
+
+    if help_requested:
+        _build_initial_parser().print_help()
+        print()
+        import tyro
+
+        # ``tyro.cli(..., args=["--help"])`` raises ``SystemExit(0)`` via
+        # argparse before returning, so control never falls through.
+        tyro.cli(
+            ExperimentConfig,
+            default=baseline,
+            args=["--help"],
+            prog="gigaevo overrides",
+        )
+
+    cfg = _apply_tyro_overrides(baseline, override_args)
+
+    config_path = _dump_resolved_config(cfg)
+
+    if dry_run:
+        logger.info(
+            "Dry run complete. Validated config at {}. Engine invocation skipped.",
+            config_path,
+        )
+        return 0
+
+    from gigaevo.config.object_graph import run_with_config
+
+    return asyncio.run(run_with_config(cfg))
 
 
 if __name__ == "__main__":
-    register_resolvers()
-    main()
+    sys.exit(main())

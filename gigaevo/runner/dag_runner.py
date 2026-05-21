@@ -228,9 +228,12 @@ class DagRunner:
         # flush any remaining DONE transitions
         await self._flush_done_queue()
 
-        # cancel metrics collector task
+        # cancel metrics collector task; awaiting joins the coroutine
+        # so its cancel propagates fully before close() runs.
         if self._metrics_collector_task:
             self._metrics_collector_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._metrics_collector_task
             self._metrics_collector_task = None
 
         await self._storage.close()
@@ -359,8 +362,6 @@ class DagRunner:
                 logger.exception(
                     "[DagScheduler] program {} failed", info.program_id[:8]
                 )
-            finally:
-                del info
 
         # Flush any remaining RUNNING→DONE transitions
         await self._flush_done_queue()
@@ -494,11 +495,13 @@ class DagRunner:
                 logger.info("[DagScheduler] launched {} programs", count)
             except Exception:
                 logger.exception("[DagScheduler] batch mark-started failed")
-                # Cancel tasks whose state transition failed
+                # Cancel tasks whose state transition failed; awaiting
+                # joins each one so the loop doesn't leave half-cancelled
+                # coroutines hanging off ``_active``.
                 for pid in launched_ids:
                     info = self._active.pop(pid, None)
-                    if info and not info.task.done():
-                        info.task.cancel()
+                    if info is not None:
+                        await self._cancel_task(info)
 
     async def _execute_dag(self, dag: DAG, program: Program) -> None:
         ok = True

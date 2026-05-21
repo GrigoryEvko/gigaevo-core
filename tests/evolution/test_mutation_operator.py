@@ -322,7 +322,7 @@ class TestOnProgramIngested:
 
 
 # ---------------------------------------------------------------------------
-# Audit finding 3: LLM agent input verification
+# LLM agent input verification
 # ---------------------------------------------------------------------------
 
 

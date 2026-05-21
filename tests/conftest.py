@@ -219,20 +219,6 @@ def fresh_executor():
     shutdown_executor()
 
 
-# ---------------------------------------------------------------------------
-# OmegaConf custom resolvers registered once per session for tests that
-# compose YAMLs without going through ``run.py``. The resolvers use
-# ``replace=True``, so re-import or repeated session-scope evaluation is safe.
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture(autouse=True, scope="session")
-def _register_omegaconf_resolvers():
-    from gigaevo.config.resolvers import register_resolvers
-
-    register_resolvers()
-    yield
-
 
 # ---------------------------------------------------------------------------
 # Fixtures

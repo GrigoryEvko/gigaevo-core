@@ -451,7 +451,7 @@ class TestBanditModelRouter:
             router._select()
             return router.get_last_model()
 
-        result = asyncio.get_event_loop().run_until_complete(_run())
+        result = asyncio.run(_run())
         assert result == "model_a"
 
     def test_get_last_model_pops(self):
@@ -466,7 +466,7 @@ class TestBanditModelRouter:
             second = router.get_last_model()
             return first, second
 
-        first, second = asyncio.get_event_loop().run_until_complete(_run())
+        first, second = asyncio.run(_run())
         assert first == "model_a"
         assert second is None
 
@@ -987,7 +987,7 @@ class TestMultiModelRouterGetLastModel:
             router._select()
             return router.get_last_model()
 
-        result = asyncio.get_event_loop().run_until_complete(_run())
+        result = asyncio.run(_run())
         assert result == "m1"
 
     def test_no_task_returns_none(self):
@@ -1017,7 +1017,7 @@ class TestSharedTaskModelMap:
             structured._select()
             return router.get_last_model()
 
-        result = asyncio.get_event_loop().run_until_complete(_run())
+        result = asyncio.run(_run())
         assert result == "m1"
 
 
@@ -1038,7 +1038,7 @@ class TestStructuredOutputRouterWithOverride:
             _, name = structured._select()
             return name
 
-        name = asyncio.get_event_loop().run_until_complete(_run())
+        name = asyncio.run(_run())
         assert name in ["model_a", "model_b"]
         stats = router.get_bandit_stats()
         total = sum(s["total_pulls"] for s in stats.values())
@@ -1228,7 +1228,7 @@ class TestBanditModelRouterEdgeCases:
             structured._select()
             return router.get_last_model()
 
-        result = asyncio.get_event_loop().run_until_complete(_run())
+        result = asyncio.run(_run())
         assert result in ["m1", "m2"]
         total_pulls = sum(s["total_pulls"] for s in router.get_bandit_stats().values())
         assert total_pulls == 1
@@ -1301,7 +1301,7 @@ class TestMultiModelRouterValidation:
             router._select()
             return router.get_last_model()
 
-        result = asyncio.get_event_loop().run_until_complete(_run())
+        result = asyncio.run(_run())
         assert result == "only"
 
 

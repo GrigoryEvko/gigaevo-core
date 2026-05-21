@@ -1,7 +1,7 @@
 """Strict-construction wrapper around ``langchain_openai.ChatOpenAI``.
 
 ``ChatOpenAI`` silently reroutes unknown kwargs into ``model_kwargs`` and
-ships them to the OpenAI HTTP endpoint, so a YAML typo only surfaces as
+ships them to the OpenAI HTTP endpoint, so a config typo only surfaces as
 an opaque remote error. :func:`strict_chat_openai` validates every
 kwarg against the union of ``ChatOpenAI.model_fields`` and its Pydantic
 aliases before construction; unknown kwargs and an unresolved
