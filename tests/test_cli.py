@@ -178,15 +178,81 @@ class TestCliTyroOverride:
         # genuinely changed the resolved value.
         assert dumped["seed"] != 99
 
-    def test_override_triggers_cross_field_validator(self, tmp_path: Path) -> None:
+    def test_help_with_override_reaches_tyro_with_overrides(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """``--help`` must not short-circuit before overrides reshape the
+        discriminated-union schema. The combined invocation should print
+        the help for the *chosen* variant, not the baseline default."""
+        from run import main
+
+        exp = _make_experiment(tmp_path)
+        # ``--help`` forwarded to tyro raises SystemExit; ``main``
+        # returns its exit code.
+        exit_code = main([str(exp), "--help"])
+        assert exit_code == 0
+        captured = capsys.readouterr()
+        # Help output should be on stdout (argparse / tyro convention).
+        assert "experiment" in captured.out.lower()
+
+    def test_repeated_flag_emits_warning(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Argparse / tyro silently last-wins on repeated ``--flag``;
+        operators should see a warning so they notice the collision."""
+        import logging
+        from run import main
+
+        # Wire loguru -> caplog so caplog.records includes the warning.
+        from loguru import logger as loguru_logger
+
+        class _CaplogSink:
+            def write(self, msg: str) -> None:
+                caplog.records.append(
+                    logging.LogRecord(
+                        name="run",
+                        level=logging.WARNING,
+                        pathname=__file__,
+                        lineno=0,
+                        msg=msg,
+                        args=(),
+                        exc_info=None,
+                    )
+                )
+
+        handler_id = loguru_logger.add(_CaplogSink(), level="WARNING")
+        try:
+            exp = _make_experiment(tmp_path)
+            exit_code = main(
+                [str(exp), "--dry-run", "--seed", "5", "--seed", "9"]
+            )
+        finally:
+            loguru_logger.remove(handler_id)
+        assert exit_code == 0
+        warnings = [
+            r.msg
+            for r in caplog.records
+            if r.levelno == logging.WARNING and "--seed" in str(r.msg)
+        ]
+        assert warnings, "expected a repeated-flag warning"
+
+    def test_override_triggers_cross_field_validator(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
         """tyro merges overrides then Pydantic re-validates. An override
-        that violates a cross-field invariant must raise — not be
-        accepted silently."""
+        that violates a cross-field invariant must exit non-zero and
+        surface a framed error block — not be accepted silently and not
+        leak a raw Python stack trace."""
         from run import main
 
         exp = _make_experiment(tmp_path)
         # The experiment's name is "cli_test", so dataplane.key_prefix
         # must equal "gigaevo:cli_test". Renaming the experiment via
         # CLI without updating key_prefix breaks the invariant.
-        with pytest.raises(Exception):
-            main([str(exp), "--dry-run", "--name", "renamed"])
+        exit_code = main([str(exp), "--dry-run", "--name", "renamed"])
+        assert exit_code == 2
+        captured = capsys.readouterr()
+        assert "Configuration validation failed" in captured.err
+        # The friendly framed block should not include a Python
+        # traceback header.
+        assert "Traceback" not in captured.err

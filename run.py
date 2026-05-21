@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from collections import OrderedDict
 import contextlib
 import os
 from pathlib import Path
@@ -20,6 +21,7 @@ import tempfile
 
 from dotenv import load_dotenv
 from loguru import logger
+from pydantic import ValidationError
 
 from gigaevo.config.experiment_loader import build_experiment
 from gigaevo.config.schemas.experiment import ExperimentConfig
@@ -85,6 +87,91 @@ def _apply_tyro_overrides(
         args=override_args,
         prog="gigaevo overrides",
     )
+
+
+def _format_validation_loc(loc: tuple[object, ...]) -> str:
+    """Map a pydantic ``loc`` tuple to a CLI-style ``--a.b.c`` flag name.
+
+    Numeric indices stay numeric (``--items.0.name``); string segments
+    have underscores rewritten to hyphens to match tyro's convention.
+    """
+    if not loc:
+        return "<root>"
+    parts: list[str] = []
+    for seg in loc:
+        if isinstance(seg, int):
+            parts.append(str(seg))
+        else:
+            parts.append(str(seg).replace("_", "-"))
+    return "--" + ".".join(parts)
+
+
+def _format_validation_error(exc: ValidationError) -> str:
+    """Render a Pydantic ``ValidationError`` as a tyro-style framed block.
+
+    The shape matches ``tyro``'s own argparse error frames so operators
+    see a consistent error surface regardless of whether the failure was
+    a CLI parse error or a cross-field validator firing.
+    """
+    title = "Configuration validation failed"
+    lines = [
+        "╭─ " + title + " " + "─" * max(0, 70 - len(title) - 4) + "╮",
+    ]
+    errors = exc.errors()
+    if not errors:
+        lines.append("│  (no error details available)")
+    for err in errors:
+        flag = _format_validation_loc(err.get("loc", ()))
+        msg = err.get("msg", "invalid value")
+        lines.append(f"│  {flag}")
+        lines.append(f"│    {msg}")
+        ctx = err.get("ctx")
+        if isinstance(ctx, dict):
+            for k, v in ctx.items():
+                lines.append(f"│    ({k}: {v})")
+    lines.append("╰" + "─" * 72 + "╯")
+    return "\n".join(lines)
+
+
+def _warn_on_repeated_flags(override_args: list[str]) -> None:
+    """Emit a WARNING for each repeated ``--flag`` in the override list.
+
+    Tyro / argparse silently last-wins on repeats. Operators chaining
+    multiple sweeps or template fragments occasionally end up with two
+    conflicting overrides for the same field; surfacing the collision
+    lets them notice before the resolved-config dump bakes in the wrong
+    value.
+    """
+    seen: OrderedDict[str, list[str]] = OrderedDict()
+    i = 0
+    while i < len(override_args):
+        token = override_args[i]
+        if token.startswith("--"):
+            key, _, inline_value = token.partition("=")
+            if inline_value:
+                value = inline_value
+            elif i + 1 < len(override_args) and not override_args[i + 1].startswith(
+                "--"
+            ):
+                value = override_args[i + 1]
+                i += 1
+            else:
+                value = ""
+            seen.setdefault(key, []).append(value)
+        i += 1
+    for flag, values in seen.items():
+        if len(values) <= 1:
+            continue
+        winning = values[-1]
+        discarded = values[:-1]
+        logger.warning(
+            "Override {} appeared {} times; last-wins resolved to {!r}, "
+            "discarding {!r}",
+            flag,
+            len(values),
+            winning,
+            discarded,
+        )
 
 
 def _dump_resolved_config(cfg: ExperimentConfig) -> Path:
@@ -159,23 +246,46 @@ def main(argv: list[str] | None = None) -> int:
 
     load_dotenv()
 
-    baseline = build_experiment(experiment_path)
+    try:
+        baseline = build_experiment(experiment_path)
+    except ValidationError as exc:
+        # The experiment module itself produced a config that fails
+        # Pydantic validation. Surface a friendly framed block instead
+        # of the raw stack trace; the operator wants to know which CLI
+        # flag would fix it, not how the Python interpreter walked here.
+        print(_format_validation_error(exc), file=sys.stderr)
+        return 2
+
+    _warn_on_repeated_flags(override_args)
 
     if help_requested:
         _build_initial_parser().print_help()
         print()
         import tyro
 
-        # ``tyro.cli(..., args=["--help"])`` raises ``SystemExit(0)`` via
-        # argparse before returning, so control never falls through.
-        tyro.cli(
-            ExperimentConfig,
-            default=baseline,
-            args=["--help"],
-            prog="gigaevo overrides",
-        )
+        # Forward the full override list so a discriminated-union choice
+        # (e.g. ``--llm.kind heterogeneous``) reshapes the schema *before*
+        # tyro materialises the field tree. Without the forward, the
+        # printed help shows only the baseline-discriminator's fields and
+        # the operator can't see what flags the chosen variant exposes.
+        try:
+            tyro.cli(
+                ExperimentConfig,
+                default=baseline,
+                args=[*override_args, "--help"],
+                prog="gigaevo overrides",
+            )
+        except SystemExit as exit_exc:
+            # tyro raises SystemExit(0) after printing --help; preserve
+            # the exit code so wrapper scripts read a successful help.
+            return int(exit_exc.code or 0)
+        return 0
 
-    cfg = _apply_tyro_overrides(baseline, override_args)
+    try:
+        cfg = _apply_tyro_overrides(baseline, override_args)
+    except ValidationError as exc:
+        print(_format_validation_error(exc), file=sys.stderr)
+        return 2
 
     config_path = _dump_resolved_config(cfg)
 
