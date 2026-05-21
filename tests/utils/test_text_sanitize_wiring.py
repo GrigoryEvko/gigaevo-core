@@ -429,6 +429,61 @@ class TestRedisMetricsBackendSanitization:
         # Prefix is intact.
         assert key.startswith("test_metrics:history:")
 
+    def test_flush_applies_ttl_to_history_latest_meta(self) -> None:
+        """Every flush sets TTLs on the keys it touched so abandoned
+        cells from a sweep with a rotating ``key_prefix`` evict instead
+        of accumulating forever."""
+        from gigaevo.utils.trackers.backends.redis import RedisMetricsBackend
+        from gigaevo.utils.trackers.configs import RedisMetricsConfig
+
+        cfg = RedisMetricsConfig(
+            redis_url="redis://localhost:6379/0",
+            key_prefix="ttl_metrics",
+            store_history=True,
+            history_ttl_secs=42,
+            latest_ttl_secs=37,
+        )
+        backend = RedisMetricsBackend(cfg)
+        backend._client = fakeredis.FakeRedis(decode_responses=True)
+
+        backend.write_scalar("loss/train", 0.5, step=1, wall_time=1.0)
+        backend.flush()
+
+        history_ttl = backend._client.ttl(backend._k_history("loss/train"))
+        latest_ttl = backend._client.ttl(backend._k_latest())
+        meta_ttl = backend._client.ttl(backend._k_meta())
+        # Redis TTL returns the remaining seconds; the freshly-set
+        # values must equal the configured TTL (within 1s of slop for
+        # the fakeredis clock).
+        assert 41 <= history_ttl <= 42
+        assert 36 <= latest_ttl <= 37
+        assert 36 <= meta_ttl <= 37
+
+    def test_flush_with_disabled_ttl_keeps_keys_persistent(self) -> None:
+        """``history_ttl_secs=0`` and ``latest_ttl_secs=0`` preserve the
+        legacy no-TTL behaviour so callers that snapshot the database
+        out of band do not see their archives evicted."""
+        from gigaevo.utils.trackers.backends.redis import RedisMetricsBackend
+        from gigaevo.utils.trackers.configs import RedisMetricsConfig
+
+        cfg = RedisMetricsConfig(
+            redis_url="redis://localhost:6379/0",
+            key_prefix="ttl_off",
+            store_history=True,
+            history_ttl_secs=0,
+            latest_ttl_secs=0,
+        )
+        backend = RedisMetricsBackend(cfg)
+        backend._client = fakeredis.FakeRedis(decode_responses=True)
+
+        backend.write_scalar("loss", 1.0, step=1, wall_time=1.0)
+        backend.flush()
+
+        # ``-1`` in Redis means "no TTL" (key persists indefinitely).
+        assert backend._client.ttl(backend._k_history("loss")) == -1
+        assert backend._client.ttl(backend._k_latest()) == -1
+        assert backend._client.ttl(backend._k_meta()) == -1
+
     def test_history_key_caps_length(self) -> None:
         backend = self._make_backend()
         long_tag = "x" * 500

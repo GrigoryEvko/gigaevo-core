@@ -124,6 +124,9 @@ class RedisMetricsBackend(LoggerBackend):
 
         try:
             pipe = self._client.pipeline(transaction=False)
+            history_keys_touched: set[str] = set()
+            latest_touched = False
+            meta_touched = False
 
             for entry in buf:
                 # Sanitize the tag at the Redis boundary. The wire encoder
@@ -139,8 +142,10 @@ class RedisMetricsBackend(LoggerBackend):
                 # Update latest value
                 if kind == "scalar":
                     pipe.hset(self._k_latest(), tag, entry["value"])
+                    latest_touched = True
                 elif kind == "text":
                     pipe.hset(self._k_latest(), tag, entry["value"])
+                    latest_touched = True
                 # histograms don't update latest (too large)
 
                 # Store history if enabled
@@ -161,9 +166,25 @@ class RedisMetricsBackend(LoggerBackend):
                     pipe.rpush(history_key, history_entry)
                     # Trim to max size (FIFO)
                     pipe.ltrim(history_key, -self.cfg.max_history_per_metric, -1)
+                    history_keys_touched.add(history_key)
 
             # Update metadata
             pipe.hset(self._k_meta(), "last_update", str(time.time()))
+            meta_touched = True
+
+            # Refresh TTL on every key touched this flush. Sliding TTL
+            # via EXPIRE: each new append resets the eviction clock, so
+            # active series persist while abandoned ones (e.g. those
+            # left by a sweep cell whose key_prefix has rotated) evict
+            # after ``history_ttl_secs`` of inactivity. ``0`` disables.
+            if self.cfg.history_ttl_secs > 0:
+                for history_key in history_keys_touched:
+                    pipe.expire(history_key, self.cfg.history_ttl_secs)
+            if latest_touched and self.cfg.latest_ttl_secs > 0:
+                pipe.expire(self._k_latest(), self.cfg.latest_ttl_secs)
+            if meta_touched and self.cfg.latest_ttl_secs > 0:
+                pipe.expire(self._k_meta(), self.cfg.latest_ttl_secs)
+
             pipe.execute()
 
         except Exception as e:

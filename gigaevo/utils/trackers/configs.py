@@ -32,6 +32,21 @@ class RedisMetricsConfig(BaseModel):
     max_history_per_metric: int = Field(
         default=10000, description="Max history entries per metric (FIFO)"
     )
+    # Per-key TTL applied via EXPIRE after every history append. ``0``
+    # disables TTL (legacy behaviour: history accumulates until the
+    # operator flushes the database). Without a TTL the metrics
+    # namespace grows unbounded across sweep cells whose key_prefix
+    # changes per cell but whose history keys outlive the run.
+    history_ttl_secs: int = Field(
+        default=7 * 24 * 3600,
+        ge=0,
+        description="TTL (seconds) applied to each metrics history key; 0 disables.",
+    )
+    latest_ttl_secs: int = Field(
+        default=7 * 24 * 3600,
+        ge=0,
+        description="TTL (seconds) applied to the latest-value hash; 0 disables.",
+    )
 
     # Connection
     max_connections: int = Field(default=10, ge=1)
