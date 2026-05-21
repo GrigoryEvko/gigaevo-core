@@ -38,6 +38,52 @@ from redis import asyncio as aioredis
 _SCRIPT_LOCK_ACQUIRE: ScriptName = make_script_name("instance_lock_acquire")
 _SCRIPT_LOCK_RENEW: ScriptName = make_script_name("instance_lock_renew")
 _SCRIPT_LOCK_RELEASE: ScriptName = make_script_name("instance_lock_release")
+_SCRIPT_LOCK_STEAL: ScriptName = make_script_name("instance_lock_steal")
+
+
+def _is_local_dead_holder(holder: str | None, my_hostname: str) -> int | None:
+    """Return the holder's pid iff ``holder`` is on this host and its pid is dead.
+
+    Returns ``None`` when the holder is on another host, the token shape
+    is unrecognisable, or the pid is still live (``os.kill(pid, 0)``
+    succeeds). The probe uses signal 0 which is delivered to the
+    process by the kernel without affecting its state; success means
+    the process exists, ``ESRCH`` (``ProcessLookupError``) means it is
+    gone. ``EPERM`` is treated as "process exists" — refusing to steal
+    a still-live process under another UID is the safer default.
+    """
+    import errno
+
+    if not holder:
+        return None
+    parts = holder.split(":")
+    # Expected shape: ``{hostname}:{pid}:{uuid}`` — three colon-separated
+    # tokens. Any other shape leaves us unable to reason about the
+    # holder; the caller falls back to surfacing the lock-collision
+    # error rather than risk evicting a live peer.
+    if len(parts) != 3:
+        return None
+    host, pid_str, _uuid = parts
+    if host != my_hostname:
+        return None
+    try:
+        pid = int(pid_str)
+    except ValueError:
+        return None
+    if pid <= 0:
+        return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return pid
+    except PermissionError:
+        # Live process owned by a different UID; do not steal.
+        return None
+    except OSError as exc:
+        if exc.errno == errno.ESRCH:
+            return pid
+        return None
+    return None
 
 
 class RedisInstanceLock:
@@ -74,6 +120,7 @@ class RedisInstanceLock:
             _SCRIPT_LOCK_ACQUIRE: load_lua_source(_SCRIPT_LOCK_ACQUIRE),
             _SCRIPT_LOCK_RENEW: load_lua_source(_SCRIPT_LOCK_RENEW),
             _SCRIPT_LOCK_RELEASE: load_lua_source(_SCRIPT_LOCK_RELEASE),
+            _SCRIPT_LOCK_STEAL: load_lua_source(_SCRIPT_LOCK_STEAL),
         }
         self._script_shas: dict[ScriptName, str] = {}
         self._reload_lock: asyncio.Lock | None = None
@@ -199,20 +246,45 @@ class RedisInstanceLock:
                 keys=[lock_key],
                 args=[self._instance_id, ttl_ms],
             )
-            if ok != 1:
-                existing = await r.get(lock_key)  # type: ignore[misc]
-                raise StorageError(
-                    f"Cannot start: another instance is using Redis prefix '{self._keys.prefix}'. "
-                    f"Lock held by: {existing}. "
-                    f"If this is a stale lock from a crashed instance, "
-                    f"manually delete Redis key: {lock_key}"
+            if ok == 1:
+                logger.info(
+                    "[RedisInstanceLock] Acquired exclusive lock for prefix '{}'",
+                    self._keys.prefix,
                 )
-            logger.info(
-                "[RedisInstanceLock] Acquired exclusive lock for prefix '{}'",
-                self._keys.prefix,
+                self._token = self._instance_id
+                return True
+
+            # Acquire failed. Inspect the current holder: if it is a
+            # dead PID on the same host, steal the lock with a
+            # token-CAS to evict the SIGKILL'd predecessor and unblock
+            # restart without waiting for the TTL.
+            existing = await r.get(lock_key)  # type: ignore[misc]
+            my_host = socket.gethostname()
+            dead_pid = _is_local_dead_holder(existing, my_host)
+            if dead_pid is not None:
+                stolen = await self._evalsha(
+                    r,
+                    _SCRIPT_LOCK_STEAL,
+                    keys=[lock_key],
+                    args=[existing or "", self._instance_id, ttl_ms],
+                )
+                if stolen == 1:
+                    logger.warning(
+                        "[RedisInstanceLock] Stole lock for prefix '{}' from "
+                        "dead local holder {!r} (pid {} no longer running)",
+                        self._keys.prefix,
+                        existing,
+                        dead_pid,
+                    )
+                    self._token = self._instance_id
+                    return True
+
+            raise StorageError(
+                f"Cannot start: another instance is using Redis prefix '{self._keys.prefix}'. "
+                f"Lock held by: {existing}. "
+                f"If this is a stale lock from a crashed instance, "
+                f"manually delete Redis key: {lock_key}"
             )
-            self._token = self._instance_id
-            return True
 
         result = await self._conn.execute("acquire_instance_lock", _acquire)
         if self._dataplane is not None:

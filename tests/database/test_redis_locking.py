@@ -117,6 +117,96 @@ class TestAcquire:
         await lock.release()
 
 
+class TestStealDeadLocalHolder:
+    """Steal-on-acquire: a SIGKILL'd local holder leaves the lock key
+    behind for the rest of its TTL. The acquire path inspects the
+    holder token and, when it identifies a dead local pid, runs a
+    token-CAS DEL+SET so the successor doesn't have to wait out the
+    TTL.
+    """
+
+    async def test_dead_pid_token_decoded_locally(self) -> None:
+        """The local helper returns the pid only for ``host:pid:uuid``
+        tokens whose host matches and whose pid is non-existent."""
+        import socket
+
+        from gigaevo.database.redis.locking import _is_local_dead_holder
+
+        host = socket.gethostname()
+        # An almost-certainly-unused pid value on most systems; pid 1 is
+        # always alive, so we use a deliberately-bogus high value and a
+        # dead-pid probe via a fresh forked process.
+        import os
+
+        # Spawn and reap a child to harvest a definitely-dead pid.
+        child_pid = os.fork()
+        if child_pid == 0:
+            os._exit(0)
+        os.waitpid(child_pid, 0)
+
+        token = f"{host}:{child_pid}:abcdef01"
+        assert _is_local_dead_holder(token, host) == child_pid
+        # Foreign host: no eviction.
+        assert _is_local_dead_holder(token, host + "-other") is None
+        # Live pid 1: no eviction.
+        live_token = f"{host}:1:abcdef01"
+        assert _is_local_dead_holder(live_token, host) is None
+        # Malformed shapes: no eviction.
+        assert _is_local_dead_holder("nope", host) is None
+        assert _is_local_dead_holder(f"{host}:not-a-pid:x", host) is None
+        assert _is_local_dead_holder(None, host) is None
+
+    async def test_acquire_steals_lock_from_dead_local_holder(
+        self, fake_redis, monkeypatch
+    ) -> None:
+        """A second acquire that targets a key still held by a dead
+        local pid succeeds via the steal path instead of raising."""
+        import socket
+
+        # Reap a child to harvest a dead pid.
+        import os
+
+        child_pid = os.fork()
+        if child_pid == 0:
+            os._exit(0)
+        os.waitpid(child_pid, 0)
+
+        host = socket.gethostname()
+        stale_token = f"{host}:{child_pid}:deadbeef"
+
+        # Seed the lock key directly with the stale token + long TTL.
+        lock = _make_lock(fake_redis, lock_expiry_secs=300, key_prefix="dead")
+        lock_key = lock._keys.instance_lock()
+        await fake_redis.set(lock_key, stale_token, px=300_000)
+
+        # Sanity: holder is the stale token.
+        assert await fake_redis.get(lock_key) == stale_token
+
+        # acquire() must steal and succeed.
+        result = await lock.acquire()
+        assert result is True
+        assert lock.is_held is True
+        # The stored value is now the new holder's instance id.
+        new_value = await fake_redis.get(lock_key)
+        assert new_value == lock.instance_id
+        await lock.release()
+
+    async def test_acquire_does_not_steal_from_foreign_host(
+        self, fake_redis
+    ) -> None:
+        """A holder on a different hostname is left alone; acquire
+        raises so the operator can resolve the cross-host collision."""
+        lock = _make_lock(fake_redis, key_prefix="foreign")
+        lock_key = lock._keys.instance_lock()
+        # Foreign hostname so the steal predicate never fires.
+        await fake_redis.set(
+            lock_key, "different-host:12345:cafef00d", px=60_000
+        )
+
+        with pytest.raises(StorageError, match="another instance"):
+            await lock.acquire()
+
+
 # ---------------------------------------------------------------------------
 # TestRelease
 # ---------------------------------------------------------------------------

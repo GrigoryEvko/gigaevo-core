@@ -119,6 +119,7 @@ _SCRIPT_COUNTER_INC: Final[ScriptName] = make_script_name("counter_inc")
 _SCRIPT_LOCK_ACQUIRE: Final[ScriptName] = make_script_name("instance_lock_acquire")
 _SCRIPT_LOCK_RENEW: Final[ScriptName] = make_script_name("instance_lock_renew")
 _SCRIPT_LOCK_RELEASE: Final[ScriptName] = make_script_name("instance_lock_release")
+_SCRIPT_LOCK_STEAL: Final[ScriptName] = make_script_name("instance_lock_steal")
 _SCRIPT_LWWR_SET: Final[ScriptName] = make_script_name("lwwr_set")
 _SCRIPT_TRANSITION_STATE: Final[ScriptName] = make_script_name("transition_state")
 _SCRIPT_ARCHIVE_SWAP: Final[ScriptName] = make_script_name("archive_swap")
@@ -1531,6 +1532,7 @@ class DataPlane:
             _SCRIPT_LOCK_ACQUIRE,
             _SCRIPT_LOCK_RENEW,
             _SCRIPT_LOCK_RELEASE,
+            _SCRIPT_LOCK_STEAL,
             _SCRIPT_LWWR_SET,
             _SCRIPT_TRANSITION_STATE,
             _SCRIPT_ARCHIVE_SWAP,

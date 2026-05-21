@@ -31,13 +31,18 @@ class RedisKeyConfig(BaseModel):
 
 
 class RedisLockConfig(BaseModel):
-    """Configuration for instance locking."""
+    """Configuration for instance locking.
+
+    Default TTL is short so a SIGKILL'd holder's lock evicts quickly;
+    the renewal interval is one-third of the TTL so a single missed
+    renewal does not lose the lock under transient network blips.
+    """
 
     lock_expiry_secs: int = Field(
-        default=300, description="Lock TTL in seconds (5 min)"
+        default=30, description="Lock TTL in seconds"
     )
     lock_renewal_secs: int = Field(
-        default=120, description="Lock renewal interval in seconds (2 min)"
+        default=10, description="Lock renewal interval in seconds"
     )
 
     model_config = {"extra": "forbid"}
@@ -71,8 +76,8 @@ class RedisProgramStorageConfig(BaseModel):
     )
 
     # Locking
-    lock_expiry_secs: int = Field(default=300)
-    lock_renewal_secs: int = Field(default=120)
+    lock_expiry_secs: int = Field(default=30)
+    lock_renewal_secs: int = Field(default=10)
 
     model_config = {"arbitrary_types_allowed": True, "extra": "forbid"}
 
