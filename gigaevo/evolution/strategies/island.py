@@ -69,8 +69,16 @@ class MapElitesIsland:
     def __init__(self, config: IslandConfig, program_storage: RedisProgramStorage):
         self.config = config
         self.program_storage = program_storage
+        # Archive keys are namespaced under both the engine-wide
+        # ``program_storage`` prefix and the per-island shard so two
+        # experiments sharing an island id (the default
+        # ``fitness_island``) cannot stomp each other's archive hash,
+        # and the startup-empty-redis check sees the keys it expects.
+        archive_prefix = (
+            f"{program_storage.config.key_prefix}:{config.redis_prefix}"
+        )
         self.archive_storage = RedisArchiveStorage(
-            program_storage=program_storage, key_prefix=config.redis_prefix
+            program_storage=program_storage, key_prefix=archive_prefix
         )
         self.state_manager = ProgramStateManager(program_storage)
         logger.info("Island {} init (max_size={})", config.island_id, config.max_size)
