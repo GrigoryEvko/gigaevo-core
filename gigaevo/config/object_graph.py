@@ -557,6 +557,22 @@ async def run_with_config(cfg: ExperimentConfig) -> int:
         except Exception:
             logger.exception("[run] exec_runner_pool.shutdown raised")
         reset_ambient_exec_runner_pool(pool_token)
+        # Tear the LokyBackend down here too — the python_executors path
+        # uses a separate process pool from the subprocess-script
+        # WorkerPool, and loky's manager thread holds sem_open file
+        # descriptors under /dev/shm that survive the parent unless the
+        # backend's own shutdown sequence runs. atexit catches the
+        # uncaught-exception path, but driving the same call here means
+        # a clean exit reclaims the shared-memory budget before the
+        # next run begins.
+        from gigaevo.programs.stages.python_executors.wrapper import (
+            shutdown_executor,
+        )
+
+        try:
+            shutdown_executor(wait=False)
+        except Exception:
+            logger.exception("[run] loky shutdown_executor raised")
         if redis_storage is not None:
             try:
                 await redis_storage.close()

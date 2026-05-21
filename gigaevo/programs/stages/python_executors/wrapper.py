@@ -40,6 +40,7 @@ serialization.
 from __future__ import annotations
 
 import asyncio
+import atexit
 from collections.abc import Mapping, Sequence
 import contextlib
 import contextvars
@@ -741,6 +742,30 @@ def shutdown_executor(*, wait: bool = False) -> None:
     backend = _default_backend
     _default_backend = None
     backend._shutdown_sync(wait=wait)
+
+
+def _atexit_shutdown_default_backend() -> None:
+    """Best-effort backend shutdown when the interpreter exits.
+
+    Catches the SIGINT-then-uncaught-KeyboardInterrupt path where the
+    driver exits without going through ``run_with_config``'s finally
+    block: the loky manager subprocess outlives the parent, holds
+    ``mp.SemLock`` file descriptors open under ``/dev/shm``, and
+    accumulates ``sem_open``-leaked entries across restarts. ``atexit``
+    runs in late-shutdown so the executor's own resource fingers
+    cannot resurrect (no event loop, no new tasks) — the only safe
+    operation is the synchronous teardown path.
+    """
+    try:
+        shutdown_executor(wait=False)
+    except Exception:  # noqa: BLE001 — atexit must never raise
+        # The interpreter is on its way out; loguru may already be
+        # half-torn-down. Silently swallow rather than crashing the
+        # exit path.
+        pass
+
+
+atexit.register(_atexit_shutdown_default_backend)
 
 
 # Module-level backward-compat shims so existing callers that reach for
