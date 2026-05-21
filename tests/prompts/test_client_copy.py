@@ -90,3 +90,32 @@ def test_copy_chain_preserves_sharing() -> None:
         CallLog(prompt_tokens=1, completion_tokens=2, cost=0.01, cost_utilization=0.001)
     )
     assert len(parent.call_logs) == 1
+
+
+def test_clear_logs_preserves_sharing_with_copies() -> None:
+    """``clear_logs`` must mutate the shared list in place.
+
+    Rebinding ``self._call_logs = []`` on the parent would silently detach
+    any outstanding ``copy()`` from the budget ledger: post-clear appends
+    from the copy would accumulate on a now-orphaned list and ``max_cost``
+    would observe zero new cost. The implementation mutates via
+    ``list.clear()``.
+    """
+    parent = _bare_client()
+    child = parent.copy()
+    child._call_logs.append(
+        CallLog(prompt_tokens=1, completion_tokens=1, cost=0.5, cost_utilization=0.05)
+    )
+    assert len(parent.call_logs) == 1
+
+    parent.clear_logs()
+
+    assert child._call_logs is parent._call_logs, (
+        "clear_logs() rebound the list reference; existing copies are now "
+        "orphaned from the budget ledger."
+    )
+    child._call_logs.append(
+        CallLog(prompt_tokens=2, completion_tokens=2, cost=0.9, cost_utilization=0.09)
+    )
+    assert len(parent.call_logs) == 1
+    assert parent.call_logs[0].cost == 0.9

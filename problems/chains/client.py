@@ -86,7 +86,15 @@ class LLMClient:
         return self._call_logs
 
     def clear_logs(self) -> None:
-        self._call_logs = []
+        """Empty the cost-tracking ledger in place.
+
+        Mutates ``_call_logs`` via ``list.clear()`` rather than rebinding
+        to a fresh list. Rebinding would orphan every copy that pinned the
+        original list (see :meth:`copy`), so subsequent appends from the
+        copy would leak past the budget guard exactly as in the bug the
+        copy-aliasing contract was introduced to prevent.
+        """
+        self._call_logs.clear()
 
     def _compute_cost(
         self, prompt_tokens: int, completion_tokens: int
