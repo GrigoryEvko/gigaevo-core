@@ -63,8 +63,15 @@ def compute_layout_metrics(points: np.ndarray) -> dict:
     centroid = np.mean(points, axis=0)
     point_var = np.var(points, axis=0)
 
-    # Convex hull area (in 2D, volume is area)
-    hull = ConvexHull(points)
+    # Convex hull area (in 2D, volume is area).
+    # ``QJ`` ("joggle") nudges nearly-collinear input by a controlled
+    # epsilon before triangulation; without it ~20% of seed layouts hit
+    # ``QHullError: initial simplex is flat`` and the layout-metrics
+    # block fails, knocking the seed out of the population. Joggle
+    # produces a slightly perturbed hull volume but the area estimate is
+    # accurate to numerical-precision tolerances — well within what the
+    # downstream metrics consume.
+    hull = ConvexHull(points, qhull_options="QJ")
     convex_hull_area = hull.volume
 
     min_area, max_area = np.min(areas), np.max(areas)
