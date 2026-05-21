@@ -64,8 +64,54 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pre-commit", "python-semantic-release"]
 typing = ["mypy>=1.10", "types-PyYAML", "types-redis", "types-psutil"]
+# Per-experiment extras: install with ``uv pip install -e '.[<name>]'``.
+# Each set covers the third-party deps a problem family imports outside
+# the core [project] dependencies block.
+alphaevolve = [
+    "jax",
+    "optax",
+    "sympy>=1.13",
+]
+chains = [
+    "absl-py",
+    "datasets>=2.14",
+    "emoji",
+    "immutabledict",
+    "langdetect",
+    "packaging>=23",
+    "syllapy",
+    "tenacity>=8.2",
+]
+geometry = [
+    "shapely>=2.0",
+]
+prompts = [
+    "absl-py",
+    "datasets>=2.14",
+    "emoji",
+    "immutabledict",
+    "langdetect",
+    "packaging>=23",
+    "syllapy",
+    "tenacity>=8.2",
+]
+all = [
+    "absl-py",
+    "datasets>=2.14",
+    "emoji",
+    "immutabledict",
+    "jax",
+    "langdetect",
+    "optax",
+    "packaging>=23",
+    "shapely>=2.0",
+    "syllapy",
+    "sympy>=1.13",
+    "tenacity>=8.2",
+]
+# Aliases retained for backward compatibility with earlier extra names.
 opt = ["jax", "optax"]
-prompt = ["nltk", "emoji", "syllapy", "langdetect", "immutabledict"]
+prompt = ["emoji", "immutabledict", "langdetect", "nltk", "syllapy"]
 test = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
