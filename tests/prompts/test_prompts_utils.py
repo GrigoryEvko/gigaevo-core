@@ -50,7 +50,11 @@ _stub_client.LLMClient = _StubLLMClient
 sys.modules.setdefault("problems.prompts.client", _stub_client)
 
 # Likewise stub the gigaevo redis storage and tools.utils dependencies; the
-# helper we test does not touch them.
+# helper we test does not touch them. Real ``gigaevo.*`` entries (if already
+# loaded by sibling tests in the same process) are saved and restored after
+# the target module captures the stub references — leaving the stubs in
+# ``sys.modules`` would shadow the real package and break any test that
+# subsequently constructs a real ``RedisProgramStorage``.
 _stub_redis = ModuleType("gigaevo.database.redis_program_storage")
 
 
@@ -64,6 +68,9 @@ class _StubRedisProgramStorageConfig:
 
 _stub_redis.RedisProgramStorage = _StubRedisProgramStorage
 _stub_redis.RedisProgramStorageConfig = _StubRedisProgramStorageConfig
+_saved_gigaevo_pkg = sys.modules.get("gigaevo")
+_saved_gigaevo_db_pkg = sys.modules.get("gigaevo.database")
+_saved_gigaevo_redis = sys.modules.get("gigaevo.database.redis_program_storage")
 sys.modules.setdefault("gigaevo", ModuleType("gigaevo"))
 sys.modules.setdefault("gigaevo.database", ModuleType("gigaevo.database"))
 sys.modules["gigaevo.database.redis_program_storage"] = _stub_redis
@@ -97,6 +104,20 @@ if _saved_tools_pkg is not None:
     sys.modules["tools"] = _saved_tools_pkg
 if _saved_tools_utils is not None:
     sys.modules["tools.utils"] = _saved_tools_utils
+
+# Mirror the same save/restore for the ``gigaevo.*`` stubs so a later test
+# constructing a real ``RedisProgramStorage`` does not get the stub class.
+sys.modules.pop("gigaevo.database.redis_program_storage", None)
+if _saved_gigaevo_redis is not None:
+    sys.modules["gigaevo.database.redis_program_storage"] = _saved_gigaevo_redis
+if _saved_gigaevo_db_pkg is None:
+    sys.modules.pop("gigaevo.database", None)
+else:
+    sys.modules["gigaevo.database"] = _saved_gigaevo_db_pkg
+if _saved_gigaevo_pkg is None:
+    sys.modules.pop("gigaevo", None)
+else:
+    sys.modules["gigaevo"] = _saved_gigaevo_pkg
 
 CallLog = _types.CallLog
 _aggregate_call_logs = _utils._aggregate_call_logs
