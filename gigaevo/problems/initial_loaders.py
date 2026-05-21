@@ -4,6 +4,7 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Protocol
 
+from loguru import logger
 from tqdm import tqdm
 
 from gigaevo.database.redis_program_storage import (
@@ -18,8 +19,21 @@ class InitialProgramLoader(Protocol):
 
 
 class DirectoryProgramLoader:
+    """Load every ``*.py`` under ``<problem_dir>/initial_programs`` into storage.
+
+    Per-file failures are isolated: a seed that fails to read, fails
+    Pydantic validation on ``Program`` construction, or fails to land in
+    Redis logs at exception level, is appended to ``skipped`` for caller
+    inspection, and the loop continues with the next file. ``skipped``
+    is exposed on the loader instance after :meth:`load` so the caller
+    can decide whether a partial population is acceptable.
+    """
+
     def __init__(self, problem_dir: str | Path):
         self.problem_dir = Path(problem_dir)
+        # ``[(path, error_text), ...]`` — populated on each call to
+        # ``load``. Empty on a clean run.
+        self.skipped: list[tuple[Path, str]] = []
 
     async def load(self, storage: RedisProgramStorage) -> list[Program]:
         initial_dir = self.problem_dir / "initial_programs"
@@ -27,6 +41,7 @@ class DirectoryProgramLoader:
             return []
         python_files = list(initial_dir.glob("*.py"))
         programs: list[Program] = []
+        self.skipped = []
         for program_file in tqdm(python_files, desc="Loading initial programs"):
             try:
                 program_code = program_file.read_text()
@@ -39,8 +54,20 @@ class DirectoryProgramLoader:
                 }
                 await storage.add(program)
                 programs.append(program)
-            except Exception:
+            except Exception as exc:
+                logger.exception(
+                    "Failed to load initial program {}: {}",
+                    program_file,
+                    exc,
+                )
+                self.skipped.append((program_file, str(exc)))
                 continue
+        if self.skipped:
+            logger.warning(
+                "Skipped {}/{} initial program(s); details above",
+                len(self.skipped),
+                len(python_files),
+            )
         return programs
 
 

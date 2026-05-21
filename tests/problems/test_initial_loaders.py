@@ -85,7 +85,7 @@ class TestDirectoryProgramLoader:
 
     @pytest.mark.asyncio
     async def test_skips_invalid_python_files(self):
-        """Test that exceptions during program loading are silently skipped."""
+        """Failed files are isolated, logged, and recorded in ``skipped``."""
         with tempfile.TemporaryDirectory() as tmpdir:
             problem_dir = Path(tmpdir)
             initial_dir = problem_dir / "initial_programs"
@@ -108,8 +108,31 @@ class TestDirectoryProgramLoader:
 
             programs = await loader.load(storage)
 
-            # Should only load the good file
+            # Should only load the good file.
             assert len(programs) == 1
+            # And expose the failure for caller inspection.
+            assert len(loader.skipped) == 1
+            skipped_path, skipped_msg = loader.skipped[0]
+            assert skipped_path.name == "bad.py"
+            assert "bad program" in skipped_msg
+
+    @pytest.mark.asyncio
+    async def test_skipped_resets_between_calls(self):
+        """A clean second call should not retain the previous run's failures."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            problem_dir = Path(tmpdir)
+            initial_dir = problem_dir / "initial_programs"
+            initial_dir.mkdir()
+            (initial_dir / "good.py").write_text("def solve():\n    return 0")
+
+            loader = DirectoryProgramLoader(problem_dir)
+            # Seed a stale skip entry to simulate a prior failed run.
+            loader.skipped = [(initial_dir / "stale.py", "old failure")]
+
+            storage = AsyncMock()
+            storage.add = AsyncMock()
+            await loader.load(storage)
+            assert loader.skipped == []
 
     @pytest.mark.asyncio
     async def test_program_code_matches_file_content(self):
