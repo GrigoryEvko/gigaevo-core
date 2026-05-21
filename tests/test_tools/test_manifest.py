@@ -4,6 +4,9 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+
+pytest.importorskip("tools.experiment.manifest")
+
 from tools.experiment.manifest import (
     VALID_STATUSES,
     VALID_TRANSITIONS,

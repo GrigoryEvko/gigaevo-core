@@ -76,10 +76,27 @@ class _StubRedisRunConfig:
 
 
 _stub_tools.RedisRunConfig = _StubRedisRunConfig
-sys.modules.setdefault("tools", ModuleType("tools"))
+# Save any pre-existing real ``tools`` / ``tools.utils`` entries so we can
+# restore them after the target module captures the stub references — leaving
+# the stubs in ``sys.modules`` would shadow the real package for any sibling
+# test in the same pytest process.
+_saved_tools_pkg = sys.modules.pop("tools", None)
+_saved_tools_utils = sys.modules.pop("tools.utils", None)
+_tools_pkg = ModuleType("tools")
+_tools_pkg.__path__ = [str(_ROOT / "tools")]
+sys.modules["tools"] = _tools_pkg
 sys.modules["tools.utils"] = _stub_tools
 
 _utils = _load_module("prompts_utils_under_test", "problems/prompts/utils.py")
+
+# Restore real entries (or remove the stubs entirely if no real entry was
+# loaded yet) so subsequent test modules see the real ``tools`` package.
+sys.modules.pop("tools", None)
+sys.modules.pop("tools.utils", None)
+if _saved_tools_pkg is not None:
+    sys.modules["tools"] = _saved_tools_pkg
+if _saved_tools_utils is not None:
+    sys.modules["tools.utils"] = _saved_tools_utils
 
 CallLog = _types.CallLog
 _aggregate_call_logs = _utils._aggregate_call_logs
