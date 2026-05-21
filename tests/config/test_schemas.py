@@ -61,6 +61,36 @@ class TestRedisConfig:
         assert parsed == original
         assert parsed.url == "redis://r:6380/2"
 
+    def test_tls_emits_rediss_scheme(self) -> None:
+        assert RedisConfig(tls=True).url.startswith("rediss://")
+        assert RedisConfig(tls=False).url.startswith("redis://")
+
+    def test_explicit_username_password_embedded_url_encoded(self) -> None:
+        cfg = RedisConfig(username="u@admin", password="p:1@!/")
+        # Reserved bytes in either credential must be percent-encoded so
+        # they cannot reshape the URL grammar (a literal ``@`` in the
+        # password would terminate the credential section early and
+        # silently redirect the client to a host of the attacker's
+        # choosing).
+        assert "u%40admin" in cfg.url
+        assert "p%3A1%40%21%2F" in cfg.url
+
+    def test_password_env_used_when_unset(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("REDIS_PASSWORD", "from-env")
+        cfg = RedisConfig()
+        assert "from-env" in cfg.url
+        # The env value must not bleed into the serialised form.
+        assert "from-env" not in cfg.model_dump_json()
+
+    def test_password_excluded_from_dump_and_repr(self) -> None:
+        cfg = RedisConfig(password="sk-secret")
+        dumped = cfg.model_dump_json()
+        assert "sk-secret" not in dumped
+        assert "password" not in dumped
+        assert "sk-secret" not in repr(cfg)
+
 
 class TestDataPlaneSettings:
     def test_compose_with_redis(self) -> None:
