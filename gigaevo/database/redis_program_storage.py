@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Iterable
+from dataclasses import dataclass
 import gc
 from itertools import islice
 from types import TracebackType
@@ -33,7 +34,59 @@ if TYPE_CHECKING:
 
 T = TypeVar("T")
 
-__all__ = ["RedisProgramStorageConfig", "RedisProgramStorage"]
+__all__ = [
+    "RedisProgramStorageConfig",
+    "RedisProgramStorage",
+    "StrandedRecoveryResult",
+]
+
+
+@dataclass(slots=True)
+class StrandedRecoveryResult:
+    """Per-bucket counts emitted by :meth:`recover_stranded_programs`.
+
+    The three buckets are disjoint and sum to the number of ids
+    initially present in the RUNNING status set. ``corrupted`` ids
+    have their blobs preserved under ``{prefix}:status:corrupt`` so
+    an operator can inspect them; the previous behaviour collapsed
+    them into the SREM path and silently destroyed the only proof
+    of a serialisation bug.
+
+    The instance behaves like ``self.recovered`` under int coercion,
+    boolean test, and ``==`` against integers; callers written against
+    the old ``int`` return type keep working without modification.
+    """
+
+    recovered: int = 0
+    dangling: int = 0
+    corrupted: int = 0
+
+    @property
+    def total(self) -> int:
+        return self.recovered + self.dangling + self.corrupted
+
+    def __int__(self) -> int:
+        return self.recovered
+
+    def __bool__(self) -> bool:
+        return self.recovered != 0
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, StrandedRecoveryResult):
+            return (
+                self.recovered == other.recovered
+                and self.dangling == other.dangling
+                and self.corrupted == other.corrupted
+            )
+        if isinstance(other, int):
+            return self.recovered == other
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        return hash((self.recovered, self.dangling, self.corrupted))
+
+    def __format__(self, spec: str) -> str:
+        return format(self.recovered, spec)
 
 # Constants
 MGET_CHUNK_SIZE = 1024
@@ -955,28 +1008,68 @@ class RedisProgramStorage(ProgramStorage):
         raw = await self._conn.execute("load_run_state", _get)
         return int(raw) if raw is not None else None
 
-    async def recover_stranded_programs(self) -> int:
+    async def recover_stranded_programs(self) -> StrandedRecoveryResult:
         """Reset all RUNNING programs to QUEUED after a crash/kill.
 
         Uses write_exclusive (no merge) because the caller has exclusive access
         during startup, and merge_states(RUNNING, QUEUED) would wrongly keep RUNNING.
-        Returns the number of programs recovered.
+
+        Returns a :class:`StrandedRecoveryResult` distinguishing three
+        outcomes for every id in the RUNNING set:
+
+        - ``recovered``: program blob loaded, state advanced to QUEUED;
+        - ``dangling``: status-set entry without a matching program key
+          (orphan reference; cleaned via SREM only);
+        - ``corrupted``: program key exists but deserialize failed; the
+          id is moved out of the RUNNING set into a ``status:corrupt``
+          set for operator review (the blob itself is preserved).
         """
         ids = await self.get_ids_by_status(ProgramState.RUNNING.value)
         if not ids:
-            return 0
+            return StrandedRecoveryResult()
 
-        recovered = 0
+        result = StrandedRecoveryResult()
+        running_set = self._keys.status_set(ProgramState.RUNNING.value)
+        corrupt_set = self._keys.status_set("corrupt")
+
         for pid in ids:
-            prog = await self.get(pid)
-            if prog is None:
-                # Dangling entry in status set — clean it up
+            # Probe raw existence + parsability separately so the dangling
+            # vs corrupt outcomes don't collapse into a single SREM path.
+            async def _fetch_raw(r: aioredis.Redis, _pid: str = pid) -> str | None:
+                return await r.get(self._keys.program(_pid))
+
+            raw = await self._conn.execute("recover_stranded_fetch", _fetch_raw)
+
+            if raw is None:
                 async def _clean(r: aioredis.Redis, _pid: str = pid) -> None:
-                    await r.srem(
-                        self._keys.status_set(ProgramState.RUNNING.value), _pid
-                    )
+                    await r.srem(running_set, _pid)
 
                 await self._conn.execute("recover_stranded_clean", _clean)
+                result.dangling += 1
+                logger.warning(
+                    "[RedisProgramStorage] Dangling RUNNING id {} has no "
+                    "program blob; removed from status set.",
+                    pid,
+                )
+                continue
+
+            prog = self._safe_deserialize(raw, f"recover_stranded:{pid}")
+            if prog is None:
+                async def _quarantine(
+                    r: aioredis.Redis, _pid: str = pid
+                ) -> None:
+                    pipe = r.pipeline(transaction=False)
+                    pipe.srem(running_set, _pid)
+                    pipe.sadd(corrupt_set, _pid)
+                    await pipe.execute()
+
+                await self._conn.execute("recover_stranded_quarantine", _quarantine)
+                result.corrupted += 1
+                logger.warning(
+                    "[RedisProgramStorage] Corrupt RUNNING program {} moved "
+                    "to status:corrupt for operator review (blob preserved).",
+                    pid,
+                )
                 continue
 
             # RUNNING → QUEUED bypasses the forward FSM, which has no
@@ -991,17 +1084,21 @@ class RedisProgramStorage(ProgramStorage):
 
             async def _move(r: aioredis.Redis, _pid: str = pid) -> None:
                 pipe = r.pipeline(transaction=False)
-                pipe.srem(self._keys.status_set(ProgramState.RUNNING.value), _pid)
+                pipe.srem(running_set, _pid)
                 pipe.sadd(self._keys.status_set(ProgramState.QUEUED.value), _pid)
                 await pipe.execute()
 
             await self._conn.execute("recover_stranded_move", _move)
-            recovered += 1
+            result.recovered += 1
 
         logger.info(
-            "[RedisProgramStorage] Recovered {} stranded RUNNING → QUEUED", recovered
+            "[RedisProgramStorage] Stranded RUNNING recovery: "
+            "{} recovered → QUEUED, {} dangling SREM'd, {} corrupted quarantined",
+            result.recovered,
+            result.dangling,
+            result.corrupted,
         )
-        return recovered
+        return result
 
     # --------------------- Activity Monitoring ---------------------
 

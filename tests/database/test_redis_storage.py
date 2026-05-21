@@ -1186,6 +1186,64 @@ class TestRecoverStrandedGhostId:
         queued = await fakeredis_storage.get_ids_by_status(ProgramState.QUEUED.value)
         assert prog.id in queued
 
+    async def test_corrupt_blob_quarantined_not_deleted(
+        self, fakeredis_storage, make_program
+    ) -> None:
+        """A program key whose blob fails deserialise is moved out of
+        RUNNING and into ``status:corrupt`` rather than being treated
+        as dangling and SREM'd silently. The corrupted blob itself is
+        preserved so an operator can inspect it.
+        """
+        from gigaevo.database.redis_program_storage import StrandedRecoveryResult
+
+        good = make_program(state=ProgramState.RUNNING)
+        await fakeredis_storage.add(good)
+        corrupt_id = "corrupt-id-deadbeef"
+
+        redis_conn = fakeredis_storage._conn._redis
+        await redis_conn.sadd(
+            fakeredis_storage._keys.status_set(ProgramState.RUNNING.value),
+            corrupt_id,
+        )
+        await redis_conn.set(
+            fakeredis_storage._keys.program(corrupt_id),
+            "{this is not valid json",
+        )
+
+        result = await fakeredis_storage.recover_stranded_programs()
+
+        assert isinstance(result, StrandedRecoveryResult)
+        assert result.recovered == 1
+        assert result.dangling == 0
+        assert result.corrupted == 1
+        # The corrupt blob survives for operator review.
+        raw = await redis_conn.get(fakeredis_storage._keys.program(corrupt_id))
+        assert raw == "{this is not valid json"
+        # The corrupt id has been quarantined into ``status:corrupt``.
+        corrupt_set = fakeredis_storage._keys.status_set("corrupt")
+        members = await redis_conn.smembers(corrupt_set)
+        assert corrupt_id in members
+        # Good program reached QUEUED.
+        queued = await fakeredis_storage.get_ids_by_status(ProgramState.QUEUED.value)
+        assert good.id in queued
+
+    async def test_recovery_result_is_int_compatible(
+        self, fakeredis_storage, make_program
+    ) -> None:
+        """The typed result still behaves as the recovered count under
+        boolean test, ``int()``, ``==``, and string formatting; callers
+        written against the old int return signature keep working.
+        """
+        prog = make_program(state=ProgramState.RUNNING)
+        await fakeredis_storage.add(prog)
+        result = await fakeredis_storage.recover_stranded_programs()
+
+        assert int(result) == 1
+        assert bool(result) is True
+        assert result == 1
+        assert f"{result}" == "1"
+        assert f"{result:03d}" == "001"
+
 
 # ===================================================================
 # Category P: batch_transition_by_ids — raw JSON patching fast path
