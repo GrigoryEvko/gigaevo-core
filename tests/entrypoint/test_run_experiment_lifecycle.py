@@ -1,9 +1,10 @@
-"""Lifecycle and leak-prevention tests for ``run.run_experiment``.
+"""Lifecycle and leak-prevention tests for ``run_with_config``.
 
 Covers: (1) ``serve_until_signal`` raising after ``start()`` still
-fires both ``stop()`` calls; (2) ``instantiate`` failing mid-tree still
-runs the outer ``finally``; (3) ``stop()`` is idempotent on both
-EvolutionEngine and DagRunner.
+fires both ``stop()`` calls plus dataplane shutdown and writer close;
+(2) ``build_object_graph`` failing mid-tree still runs the outer
+``finally`` (ambient pool unbound, no thread leaks); (3) ``stop()`` is
+idempotent on both EvolutionEngine and DagRunner.
 """
 
 from __future__ import annotations
@@ -16,11 +17,37 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 
+def _fake_cfg() -> types.SimpleNamespace:
+    """Minimal stand-in for an ``ExperimentConfig`` that exposes every
+    attribute :func:`run_with_config` touches."""
+    cfg = types.SimpleNamespace(
+        name="lifecycle-test",
+        problem=types.SimpleNamespace(
+            name="lifecycle-problem",
+            problem_dir="/nonexistent",
+        ),
+        pipeline=types.SimpleNamespace(prompts_dir=None),
+        redis=types.SimpleNamespace(
+            url="redis://localhost:6379/0",
+            host="localhost",
+            port=6379,
+            db=0,
+            resume=False,
+        ),
+        dataplane=types.SimpleNamespace(
+            key_prefix="lifecycle-test",
+            max_connections=4,
+        ),
+    )
+    return cfg
+
+
 @pytest.mark.asyncio
 async def test_start_then_exception_still_stops_runner_and_engine():
     """If ``serve_until_signal`` raises after the two tasks started,
-    both ``stop()`` calls must still fire before the exception escapes."""
-    import run as run_module
+    both ``stop()`` calls plus dataplane shutdown and writer close
+    must still fire before the exception escapes."""
+    import gigaevo.config.object_graph as og
 
     fake_dag_runner = MagicMock()
     fake_dag_runner.start = MagicMock()
@@ -35,13 +62,12 @@ async def test_start_then_exception_still_stops_runner_and_engine():
     fake_engine.task = None
     fake_engine._dataplane = None
     fake_engine._engine_root = None
-    fake_engine.mutation_operator = MagicMock(llm_wrapper=None, _prompt_fetcher=None)
     fake_engine.restore_state = AsyncMock()
     fake_engine.strategy = MagicMock(restore_state=AsyncMock())
 
     fake_storage = MagicMock()
     fake_storage.config = MagicMock(
-        redis_url="redis://localhost:6379/0", key_prefix="test:"
+        redis_url="redis://localhost:6379/0", key_prefix="lifecycle-test"
     )
     fake_storage.acquire_instance_lock = AsyncMock()
     fake_storage.has_data = AsyncMock(return_value=False)
@@ -55,59 +81,74 @@ async def test_start_then_exception_still_stops_runner_and_engine():
     fake_writer = MagicMock()
     fake_writer.close = MagicMock()
 
-    config_with_instances = types.SimpleNamespace(
-        redis_storage=fake_storage,
-        program_loader=fake_loader,
-        dag_runner=fake_dag_runner,
-        evolution_engine=fake_engine,
-        writer=fake_writer,
-    )
-
-    cfg = types.SimpleNamespace(
-        problem=types.SimpleNamespace(name="test"),
-        redis=MagicMock(
-            db=0,
-            host="localhost",
-            port=6379,
-            get=MagicMock(return_value=False),
-        ),
-        max_generations=None,
-        get=MagicMock(return_value=None),
-    )
-    # ``cfg.get("pipeline_builder", {})`` is queried inside run_experiment.
-    cfg.get = MagicMock(side_effect=lambda k, default=None: default)
-    cfg.redis.get = MagicMock(return_value=False)
-
     fake_dataplane = MagicMock()
     fake_dataplane.shutdown = AsyncMock()
+
+    fake_problem_ctx = MagicMock()
+    fake_problem_ctx.metrics_context = MagicMock()
+
+    fake_graph = {
+        "redis_storage": fake_storage,
+        "problem_context": fake_problem_ctx,
+        "llm": MagicMock(),
+        "strategy": MagicMock(islands=None),
+        "runtime_engine_config": MagicMock(
+            metrics_collection_interval=1.0, max_generations=None
+        ),
+        "evolution_context": MagicMock(prompt_fetcher=None),
+        "pipeline_builder": MagicMock(),
+        "dag_blueprint": MagicMock(),
+        "runtime_runner_config": MagicMock(),
+        "primary_metric": "fitness",
+        "higher_is_better": True,
+        "required_behavior_keys": ["fitness"],
+    }
 
     boom = RuntimeError("serve_until_signal failed")
 
     async def fake_serve_until_signal(*, stop_coros=(), on_stop=()):
-        # ``run_experiment`` constructs the stop coros eagerly; close them
-        # so the unawaited-coroutine warning does not pollute the test run.
         for coro in stop_coros:
             coro.close()
         raise boom
 
+    cfg = _fake_cfg()
+
     with (
-        patch.object(run_module, "instantiate", return_value=config_with_instances),
+        patch.object(og, "build_object_graph", return_value=fake_graph),
+        patch.object(og, "_build_default_writer", return_value=fake_writer),
+        patch(
+            "gigaevo.evolution.mutation.mutation_operator.LLMMutationOperator",
+            return_value=MagicMock(),
+        ),
+        patch("gigaevo.utils.metrics_tracker.MetricsTracker", return_value=MagicMock()),
+        patch(
+            "gigaevo.runner.dag_runner.DagRunner",
+            return_value=fake_dag_runner,
+        ),
         patch.object(
-            run_module,
-            "build_dataplane",
+            og, "_build_evolution_engine", return_value=fake_engine
+        ),
+        patch(
+            "gigaevo.problems.initial_loaders.DirectoryProgramLoader",
+            return_value=fake_loader,
+        ),
+        patch(
+            "gigaevo.dataplane.build_dataplane",
             AsyncMock(return_value=fake_dataplane),
         ),
-        patch.object(run_module, "build_engine_root", MagicMock(return_value=object())),
-        patch.object(run_module, "wire_storage", MagicMock()),
-        patch.object(
-            run_module,
-            "build_actor_identity",
+        patch("gigaevo.dataplane.build_engine_root", MagicMock(return_value=object())),
+        patch(
+            "gigaevo.dataplane.build_actor_identity",
             MagicMock(return_value=object()),
         ),
-        patch.object(run_module, "serve_until_signal", fake_serve_until_signal),
+        patch("gigaevo.dataplane.wire_storage", MagicMock()),
+        patch("gigaevo.dataplane.wire_dag_runner", MagicMock()),
+        patch("gigaevo.dataplane.wire_evolution_engine", MagicMock()),
+        patch("gigaevo.dataplane.wire_bandit_router", MagicMock(return_value=False)),
+        patch("gigaevo.utils.serve.serve_until_signal", fake_serve_until_signal),
     ):
         with pytest.raises(RuntimeError, match="serve_until_signal failed"):
-            await run_module.run_experiment(cfg)
+            await og.run_with_config(cfg)
 
     # Both stops must have fired before the exception escaped.
     fake_engine.stop.assert_awaited()
@@ -118,47 +159,39 @@ async def test_start_then_exception_still_stops_runner_and_engine():
 
 
 @pytest.mark.asyncio
-async def test_instantiate_failure_does_not_leak_pool_or_call_writer():
-    """``instantiate`` raising leaves no component reachable; the outer
-    ``finally`` must tolerate every ``X is None`` check, shut the pool
-    down, and reset the ambient pool token."""
+async def test_build_object_graph_failure_does_not_leak_pool():
+    """``build_object_graph`` raising leaves no component reachable; the
+    outer ``finally`` must tolerate every ``X is None`` check, shut the
+    pool down, and reset the ambient pool token."""
     from gigaevo.programs.stages.python_executors.wrapper import (
         get_ambient_exec_runner_pool,
     )
-    import run as run_module
+    import gigaevo.config.object_graph as og
 
-    boom = RuntimeError("instantiate failed mid-tree")
-
-    cfg = types.SimpleNamespace(
-        problem=types.SimpleNamespace(name="test"),
-        redis=MagicMock(),
-        max_generations=None,
-        get=MagicMock(side_effect=lambda k, default=None: default),
-    )
-    cfg.redis.get = MagicMock(return_value=False)
+    boom = RuntimeError("build_object_graph failed mid-tree")
+    cfg = _fake_cfg()
 
     before_ambient = get_ambient_exec_runner_pool()
     threads_before = {t.ident for t in threading.enumerate()}
 
-    with patch.object(run_module, "instantiate", side_effect=boom):
-        with pytest.raises(RuntimeError, match="instantiate failed mid-tree"):
-            await run_module.run_experiment(cfg)
+    with patch.object(og, "build_object_graph", side_effect=boom):
+        with pytest.raises(RuntimeError, match="build_object_graph failed mid-tree"):
+            await og.run_with_config(cfg)
 
     # Ambient pool was bound for the call and reset in finally.
     assert get_ambient_exec_runner_pool() is before_ambient
 
-    # No extra threads leaked. Allow a small window for daemon
-    # threads spawned by unrelated test machinery to settle.
+    # No extra threads leaked. Allow a small window for daemon threads
+    # spawned by unrelated test machinery to settle.
     await asyncio.sleep(0)
     threads_after = {t.ident for t in threading.enumerate()}
     leaked = threads_after - threads_before
-    assert not leaked, f"Leaked {len(leaked)} thread(s) past run_experiment"
+    assert not leaked, f"Leaked {len(leaked)} thread(s) past run_with_config"
 
 
 @pytest.mark.asyncio
 async def test_engine_stop_is_idempotent_after_serve_already_stopped_it():
     """``stop()`` called twice on EvolutionEngine and DagRunner is a no-op."""
-    # Engine.stop() with no task and no metrics collector
     engine = object.__new__(
         __import__(
             "gigaevo.evolution.engine.core", fromlist=["EvolutionEngine"]
@@ -171,10 +204,9 @@ async def test_engine_stop_is_idempotent_after_serve_already_stopped_it():
     engine.storage = MagicMock(close=AsyncMock())
 
     await engine.stop()
-    await engine.stop()  # second call must not raise
+    await engine.stop()
     assert engine._task is None
 
-    # DagRunner.stop() with no task and no metrics collector
     runner = object.__new__(
         __import__("gigaevo.runner.dag_runner", fromlist=["DagRunner"]).DagRunner
     )
@@ -192,5 +224,5 @@ async def test_engine_stop_is_idempotent_after_serve_already_stopped_it():
     runner._flush_done_queue = _flush
 
     await runner.stop()
-    await runner.stop()  # second call must not raise
+    await runner.stop()
     assert runner._task is None
