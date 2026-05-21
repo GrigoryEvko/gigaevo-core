@@ -113,10 +113,8 @@ class EnsureMetricsStage(Stage):
 
         spec = self.ctx.specs.get(key)
         if spec is None:
-            # No spec in context → keep value as-is
             return value
 
-        # Sentinel values are preserved (no clamping)
         if spec.is_sentinel(value):
             return value
 
@@ -126,9 +124,27 @@ class EnsureMetricsStage(Stage):
 
         lo, hi = bounds
         if lo is not None and value < lo:
-            value = lo
+            logger.warning(
+                "[{}] Metric '{}'={} below lower_bound={}; preserving "
+                "raw value so distinguishable signal reaches the "
+                "comparator. Widen metrics.yaml bounds if this fires "
+                "routinely.",
+                type(self).__name__,
+                key,
+                value,
+                lo,
+            )
         if hi is not None and value > hi:
-            value = hi
+            logger.warning(
+                "[{}] Metric '{}'={} above upper_bound={}; preserving "
+                "raw value so distinguishable signal reaches the "
+                "comparator. Widen metrics.yaml bounds if this fires "
+                "routinely.",
+                type(self).__name__,
+                key,
+                value,
+                hi,
+            )
         return value
 
 

@@ -163,21 +163,34 @@ class TestEnsureMetricsStage:
         assert result.status == StageState.COMPLETED
         assert prog.metrics["score"] == -1.0  # sentinel, not clamped to 0
 
-    async def test_value_clamped_to_upper_bound(self):
-        """score=200 → clamped to hi=100."""
-        stage = _make_ensure_stage()
-        stage.attach_inputs(
-            {"candidate": FloatDictContainer(data={"score": 200.0, "cost": 10.0})}
-        )
-        prog = _prog()
-        result = await stage.execute(prog)
+    async def test_value_above_upper_bound_preserved_with_warning(self):
+        """score=200 with hi=100 → raw value preserved so the comparator sees
+        the true fitness ordering; the stage emits a warning so the operator
+        knows the metrics.yaml envelope is too narrow."""
+        from io import StringIO
+        from loguru import logger as loguru_logger
+
+        buf = StringIO()
+        handler_id = loguru_logger.add(buf, level="WARNING")
+        try:
+            stage = _make_ensure_stage()
+            stage.attach_inputs(
+                {"candidate": FloatDictContainer(data={"score": 200.0, "cost": 10.0})}
+            )
+            prog = _prog()
+            result = await stage.execute(prog)
+        finally:
+            loguru_logger.remove(handler_id)
 
         assert result.status == StageState.COMPLETED
-        assert prog.metrics["score"] == 100.0
+        assert prog.metrics["score"] == 200.0
+        assert "above upper_bound" in buf.getvalue()
 
-    async def test_value_clamped_to_lower_bound(self):
-        """score=-50 (not sentinel) → clamped to lo=0."""
-        # Use a context where sentinel is very different from -50
+    async def test_value_below_lower_bound_preserved_with_warning(self):
+        """score=-50 (not sentinel) with lo=0 → raw value preserved; warning emitted."""
+        from io import StringIO
+        from loguru import logger as loguru_logger
+
         ctx = MetricsContext(
             specs={
                 "score": MetricSpec(
@@ -190,13 +203,21 @@ class TestEnsureMetricsStage:
                 ),
             }
         )
-        stage = _make_ensure_stage(ctx=ctx, factory=ctx.get_sentinels())
-        stage.attach_inputs({"candidate": FloatDictContainer(data={"score": -50.0})})
-        prog = _prog()
-        result = await stage.execute(prog)
+        buf = StringIO()
+        handler_id = loguru_logger.add(buf, level="WARNING")
+        try:
+            stage = _make_ensure_stage(ctx=ctx, factory=ctx.get_sentinels())
+            stage.attach_inputs(
+                {"candidate": FloatDictContainer(data={"score": -50.0})}
+            )
+            prog = _prog()
+            result = await stage.execute(prog)
+        finally:
+            loguru_logger.remove(handler_id)
 
         assert result.status == StageState.COMPLETED
-        assert prog.metrics["score"] == 0.0
+        assert prog.metrics["score"] == -50.0
+        assert "below lower_bound" in buf.getvalue()
 
     async def test_missing_required_key_raises(self):
         """Candidate missing 'score' key → stage FAILED."""
