@@ -734,5 +734,5 @@ class TestSearchFallbackPaths:
 
         client = make_mocked_client(handler, base_url="http://test:8000")
 
-        with pytest.raises(_json.JSONDecodeError):
+        with pytest.raises(json.JSONDecodeError):
             client.get_concept("eid-1")
