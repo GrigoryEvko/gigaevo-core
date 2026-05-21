@@ -1783,7 +1783,18 @@ class TestWorkerIdentity:
             await backend.shutdown(wait=True)
 
     async def test_two_workers_have_distinct_worker_ids(self, tmp_path) -> None:
-        """Two worker processes in the same pool generate independent worker_ids."""
+        """Two worker processes in the same pool generate independent worker_ids.
+
+        The two tasks rendezvous on a shared barrier directory: each task
+        announces itself by touching ``<barrier>/<pid>`` and then spins
+        until two such markers are present. ``time.sleep(0.5)`` payloads
+        were not enough under CPU contention from ``-n auto`` xdist runs —
+        loky's lazy spawn + the child's ``_worker_init`` cost could
+        exceed the sleep, so worker 1 finished both tasks before
+        worker 2 was ever spawned. The barrier deterministically forces
+        two concurrent live workers, which is the real invariant under
+        test.
+        """
         from gigaevo.programs.stages.python_executors.exec_runner import WorkerCall
         from gigaevo.programs.stages.python_executors.wrapper import (
             LokyBackend,
@@ -1793,23 +1804,34 @@ class TestWorkerIdentity:
 
         spill = tmp_path / "spill"
         spill.mkdir()
+        barrier = tmp_path / "barrier"
+        barrier.mkdir()
+
+        barrier_code = (
+            "import os, time\n"
+            f"_BARRIER = {str(barrier)!r}\n"
+            "def f():\n"
+            "    open(os.path.join(_BARRIER, f'{os.getpid()}.pid'), 'w').close()\n"
+            "    deadline = time.time() + 25.0\n"
+            "    while time.time() < deadline:\n"
+            "        if len(os.listdir(_BARRIER)) >= 2:\n"
+            "            return 1\n"
+            "        time.sleep(0.01)\n"
+            "    raise RuntimeError('barrier timeout: peer worker never appeared')\n"
+        )
 
         backend = LokyBackend(WorkerConfig(spill_dir=spill, max_workers=2))
         try:
             executor = backend._get_executor()
-            # Fan-out two long-ish tasks so loky has to use two distinct workers.
             futs = [
                 executor.submit(
                     _run_task,
-                    WorkerCall(
-                        code="import time\ndef f(): time.sleep(0.5); return 1",
-                        function_name="f",
-                    ),
+                    WorkerCall(code=barrier_code, function_name="f"),
                     str(spill),
                 )
                 for _ in range(2)
             ]
-            results = [f.result(timeout=30) for f in futs]
+            results = [f.result(timeout=60) for f in futs]
             ids = {r.worker_id for r in results}
             assert len(ids) == 2, f"expected 2 distinct worker_ids, got {ids}"
         finally:
