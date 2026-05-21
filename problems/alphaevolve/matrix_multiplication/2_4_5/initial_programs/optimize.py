@@ -52,16 +52,58 @@ def _make_train_step(optimizer, loss_fn):
     return _step
 
 
+def _trivial_decomposition(n: int, m: int, p: int) -> dict:
+    """Standard rank-n*m*p outer-product expansion of the matmul tensor.
+
+    The (i*m + j, j*p + k, k*n + i) entries are 1; each is a rank-1
+    outer product of three one-hot basis vectors. Returns the
+    decomposition in the validator's expected shapes (rank, n*m) /
+    (rank, m*p) / (rank, n*p) and is guaranteed to exactly reconstruct
+    the matmul tensor under any tolerance.
+    """
+    rank = n * m * p
+    u = np.zeros((rank, n * m), dtype=np.float32)
+    v = np.zeros((rank, m * p), dtype=np.float32)
+    w = np.zeros((rank, n * p), dtype=np.float32)
+    r = 0
+    for i in range(n):
+        for j in range(m):
+            for k in range(p):
+                u[r, i * m + j] = 1.0
+                v[r, j * p + k] = 1.0
+                w[r, k * n + i] = 1.0
+                r += 1
+    return {
+        "rank": rank,
+        "u_vectors": u,
+        "v_vectors": v,
+        "w_vectors": w,
+    }
+
+
 def entrypoint() -> dict:
+    """Continuous-optimisation seed that falls back to the trivial
+    rank-n*m*p decomposition when the optimiser fails to produce a
+    discrete reconstruction within tolerance.
+
+    The continuous + half-integer-STE pipeline almost never lands an
+    exact integer/half-integer match under random init, so leaving the
+    seed program at its un-rounded output makes every run start with a
+    rejected program and the LLM never gets a parent to mutate. The
+    fallback guarantees that the seed always returns a valid
+    decomposition at the trivial rank, giving the mutator something
+    concrete to evolve toward lower ranks.
+    """
     rank = 40
     num_restarts = 2
-    phase1_steps = 3000
+    phase1_steps = 4000
     phase1_lr = 0.01
     init_scale = 0.1
     l1_strength = 1e-6
     clamp_range = 4.0
-    phase2_steps = 800
+    phase2_steps = 1000
     phase2_lr = 1e-4
+    atol = 1e-6
 
     target_tensor = get_matrix_multiplication_tensor(n, m, p)
     main_key = jax.random.PRNGKey(42)
@@ -131,6 +173,13 @@ def entrypoint() -> dict:
     u_vectors = u_reshaped.T
     v_vectors = v_reshaped.T
     w_vectors = w_reshaped.T
+
+    reconstructed = np.einsum("ir,jr,kr->ijk", u_reshaped, v_reshaped, w_reshaped)
+    diff = float(np.max(np.abs(reconstructed - np.array(target_tensor))))
+    if diff > atol or not np.all(np.isfinite(u_vectors)) \
+        or not np.all(np.isfinite(v_vectors)) \
+        or not np.all(np.isfinite(w_vectors)):
+        return _trivial_decomposition(n, m, p)
 
     return {
         "rank": rank,
