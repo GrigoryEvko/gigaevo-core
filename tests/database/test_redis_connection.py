@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -67,9 +68,17 @@ class TestExecuteRetry:
             await conn.execute("test_op", always_fail)
 
     async def test_exponential_backoff_delay(self) -> None:
-        """Verify retry delays increase exponentially."""
+        """Verify retry delays increase across attempts.
+
+        Each retry drops the cached pool and rebuilds via ``get()``;
+        a tracking sleep replaces the real backoff so the test does
+        not pay wallclock. The exact delay value is now jittered, so
+        the comparison is on the underlying request rather than the
+        observed value.
+        """
         conn = RedisConnection(_make_config(max_retries=3, retry_delay=0.01))
         mock_redis = AsyncMock()
+        mock_redis.ping = AsyncMock()
         conn._redis = mock_redis
 
         delays = []
@@ -82,13 +91,23 @@ class TestExecuteRetry:
         async def always_fail(r):
             raise ConnectionError("fail")
 
-        with patch("gigaevo.database.redis.connection.asyncio.sleep", tracking_sleep):
-            with pytest.raises(StorageError):
-                await conn.execute("test_op", always_fail)
+        with patch(
+            "gigaevo.database.redis.connection.aioredis.from_url",
+            return_value=mock_redis,
+        ):
+            with patch(
+                "gigaevo.database.redis.connection.asyncio.sleep", tracking_sleep
+            ):
+                with pytest.raises(StorageError):
+                    await conn.execute("test_op", always_fail)
 
-        # max_retries=3: fail on 1st (sleep 0.01), fail on 2nd (sleep 0.02), fail on 3rd (raises)
+        # max_retries=3: 2 sleeps before final raise. Jitter scales each
+        # request by [0.5, 1.0), so we compare the geometric progression
+        # by upper bounds instead of exact equality.
         assert len(delays) == 2
-        assert delays[0] <= delays[1]  # exponential increase
+        assert delays[0] <= 0.01
+        assert delays[1] <= 0.02
+        await conn.close()
 
     async def test_refuses_when_closing(self) -> None:
         conn = RedisConnection(_make_config())
@@ -233,12 +252,30 @@ class TestProperties:
 
 
 class TestExponentialBackoffBoundary:
-    """Retries must happen with increasing delays up to the configured max."""
+    """Retries must happen with non-decreasing delays up to the cap.
+
+    The retry path drops the cached pool on failure so the next
+    attempt's ``get()`` rebuilds against a healthy backend; the tests
+    inject the mock pool both as the initial ``_redis`` and as the
+    ``from_url`` return value so the rebuild branch produces the same
+    mock. Backoff is now jittered with a ``[0.5, 1.0)`` factor, so
+    delay assertions are on the upper bound rather than equality.
+    """
+
+    @staticmethod
+    def _patched_from_url(mock_redis):
+        return patch(
+            "gigaevo.database.redis.connection.aioredis.from_url",
+            return_value=mock_redis,
+        )
 
     async def test_delays_increase_exponentially(self) -> None:
-        """Each retry delay should be 2x the previous one, up to the cap of 1.0."""
+        """Each retry's expected delay doubles. Jitter scales by [0.5,1) so
+        the observed delay can dip below the prior call's bound; we instead
+        compare adjacent upper bounds (doubled expected base)."""
         conn = RedisConnection(_make_config(max_retries=5, retry_delay=0.01))
         mock_redis = AsyncMock()
+        mock_redis.ping = AsyncMock()
         conn._redis = mock_redis
 
         delays: list[float] = []
@@ -251,22 +288,26 @@ class TestExponentialBackoffBoundary:
         async def always_fail(r):
             raise ConnectionError("fail")
 
-        with patch("gigaevo.database.redis.connection.asyncio.sleep", tracking_sleep):
-            with pytest.raises(StorageError):
-                await conn.execute("test_op", always_fail)
+        with self._patched_from_url(mock_redis):
+            with patch(
+                "gigaevo.database.redis.connection.asyncio.sleep", tracking_sleep
+            ):
+                with pytest.raises(StorageError):
+                    await conn.execute("test_op", always_fail)
 
         # max_retries=5: attempts 1-4 sleep, attempt 5 raises
         assert len(delays) == 4
-        # Verify each delay is >= previous (exponential growth)
-        for i in range(1, len(delays)):
-            assert delays[i] >= delays[i - 1], (
-                f"Delay {i} ({delays[i]}) should be >= delay {i - 1} ({delays[i - 1]})"
-            )
+        expected_caps = [0.01, 0.02, 0.04, 0.08]
+        for observed, cap in zip(delays, expected_caps, strict=True):
+            assert observed <= cap, f"observed={observed} exceeds cap {cap}"
+        await conn.close()
 
-    async def test_delay_capped_at_one_second(self) -> None:
-        """Even with large retry_delay, the delay should be capped at 1.0 second."""
-        conn = RedisConnection(_make_config(max_retries=4, retry_delay=0.5))
+    async def test_delay_capped_at_thirty_seconds(self) -> None:
+        """Large retry_delay values are capped at the module-level
+        ``_MAX_BACKOFF_S`` (30s) before jitter scaling."""
+        conn = RedisConnection(_make_config(max_retries=4, retry_delay=120.0))
         mock_redis = AsyncMock()
+        mock_redis.ping = AsyncMock()
         conn._redis = mock_redis
 
         delays: list[float] = []
@@ -279,18 +320,25 @@ class TestExponentialBackoffBoundary:
         async def always_fail(r):
             raise ConnectionError("fail")
 
-        with patch("gigaevo.database.redis.connection.asyncio.sleep", tracking_sleep):
-            with pytest.raises(StorageError):
-                await conn.execute("test_op", always_fail)
+        with self._patched_from_url(mock_redis):
+            with patch(
+                "gigaevo.database.redis.connection.asyncio.sleep", tracking_sleep
+            ):
+                with pytest.raises(StorageError):
+                    await conn.execute("test_op", always_fail)
 
-        # All delays must be <= 1.0 (the cap in the source code)
+        # 30s cap with [0.5, 1.0) jitter ⇒ each delay is in [15, 30).
         for d in delays:
-            assert d <= 1.0, f"Delay {d} exceeds the 1.0s cap"
+            assert d < 30.0, f"Delay {d} exceeds the 30s cap"
+            assert d >= 15.0, f"Delay {d} undershoots the [0.5, 1.0) jitter floor"
+        await conn.close()
 
     async def test_delay_doubles_each_retry(self) -> None:
-        """Verify the delay exactly doubles each retry (before hitting the cap)."""
+        """The pre-jitter base doubles each retry; observed delays sit in
+        ``[0.5 * base, base)`` per the jitter contract."""
         conn = RedisConnection(_make_config(max_retries=4, retry_delay=0.01))
         mock_redis = AsyncMock()
+        mock_redis.ping = AsyncMock()
         conn._redis = mock_redis
 
         delays: list[float] = []
@@ -303,16 +351,89 @@ class TestExponentialBackoffBoundary:
         async def always_fail(r):
             raise ConnectionError("fail")
 
-        with patch("gigaevo.database.redis.connection.asyncio.sleep", tracking_sleep):
-            with pytest.raises(StorageError):
-                await conn.execute("test_op", always_fail)
+        with self._patched_from_url(mock_redis):
+            with patch(
+                "gigaevo.database.redis.connection.asyncio.sleep", tracking_sleep
+            ):
+                with pytest.raises(StorageError):
+                    await conn.execute("test_op", always_fail)
 
         # max_retries=4: 3 sleeps before final raise
         assert len(delays) == 3
-        # Expected: 0.01, 0.02, 0.04
-        assert abs(delays[0] - 0.01) < 1e-9
-        assert abs(delays[1] - 0.02) < 1e-9
-        assert abs(delays[2] - 0.04) < 1e-9
+        bases = [0.01, 0.02, 0.04]
+        for d, base in zip(delays, bases, strict=True):
+            assert 0.5 * base <= d < base, (
+                f"delay {d} outside jitter window for base {base}"
+            )
+        await conn.close()
+
+    async def test_pool_dropped_after_max_retries(self) -> None:
+        """After the final retry raises, the cached pool is None so the
+        next op rebuilds. Previously, the dead pool stuck around and
+        every subsequent op also surfaced its corruption."""
+        conn = RedisConnection(_make_config(max_retries=2, retry_delay=0.01))
+        mock_redis = AsyncMock()
+        mock_redis.ping = AsyncMock()
+        conn._redis = mock_redis
+
+        async def always_fail(r):
+            raise ConnectionError("fail")
+
+        with patch(
+            "gigaevo.database.redis.connection.aioredis.from_url",
+            return_value=mock_redis,
+        ):
+            with patch(
+                "gigaevo.database.redis.connection.asyncio.sleep", AsyncMock()
+            ):
+                with pytest.raises(StorageError):
+                    await conn.execute("test_op", always_fail)
+        # The pool is None now; ``is_connected`` reflects that.
+        assert conn._redis is None
+        assert conn.is_connected is False
+
+    async def test_reconciler_drops_pool_on_ping_failure(self) -> None:
+        """Once started, the reconciler PINGs the pool periodically and
+        drops it on transport error so the next op rebuilds against a
+        healthy backend."""
+        conn = RedisConnection(_make_config())
+        mock_redis = AsyncMock()
+        mock_redis.ping = AsyncMock(side_effect=ConnectionError("backend gone"))
+        mock_redis.aclose = AsyncMock()
+        mock_redis.connection_pool = MagicMock()
+        mock_redis.connection_pool.disconnect = AsyncMock()
+        conn._redis = mock_redis
+
+        # Patch sleep to short-circuit so the reconciler's loop runs once.
+        sleep_calls = 0
+
+        async def fast_sleep(d):
+            nonlocal sleep_calls
+            sleep_calls += 1
+            if sleep_calls > 2:
+                raise asyncio.CancelledError()
+
+        with patch(
+            "gigaevo.database.redis.connection.asyncio.sleep", fast_sleep
+        ):
+            conn.start_reconciler()
+            with contextlib.suppress(Exception):
+                await conn._reconcile_task
+
+        # First PING failed; the pool was dropped.
+        assert conn._redis is None
+
+    async def test_jittered_backoff_range(self) -> None:
+        """The jitter factor stays in ``[0.5, 1.0)`` of the requested
+        delay so reconnect spam from many workers does not pile on the
+        same instant."""
+        from gigaevo.database.redis.connection import _jittered_backoff
+
+        for base in (0.1, 1.0, 30.0, 1000.0):
+            for _ in range(50):
+                observed = _jittered_backoff(base)
+                cap = min(base, 30.0)
+                assert 0.5 * cap <= observed < cap or observed == 0.0
 
     async def test_single_retry_no_sleep(self) -> None:
         """With max_retries=1, there should be no sleep at all (immediate raise)."""

@@ -138,8 +138,12 @@ class RedisProgramStorage(ProgramStorage):
         """Acquire instance lock and start metrics collection."""
         if not self.config.read_only:
             await self._lock.acquire()
-        # Ensure connection is established
+        # Ensure connection is established and the background reconciler
+        # is polling. The reconciler is opt-in (started here, not in
+        # ``get()``) so unit tests that drive ``execute`` directly do
+        # not race with its sleep loop.
         await self._conn.get()
+        self._conn.start_reconciler()
         self._metrics.start()
         return self
 
