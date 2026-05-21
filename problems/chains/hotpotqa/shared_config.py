@@ -101,6 +101,32 @@ def load_jsonl(path: str) -> list[dict]:
     return samples
 
 
+def resolve_n_samples(default: int) -> int:
+    """Resolve the per-validate sample budget from ``HOTPOTQA_STATIC_N_SAMPLES``.
+
+    Every static-variant validator reads the same env knob so an operator
+    can shrink the slice for smoke runs without editing each variant.
+    Returns ``default`` when the env var is unset; otherwise the parsed
+    positive integer. Raises ``ValueError`` on non-integer or non-positive
+    input rather than silently falling back, so a typo can't ship as a
+    confusing default.
+    """
+    raw = os.environ.get("HOTPOTQA_STATIC_N_SAMPLES")
+    if raw is None or raw == "":
+        return default
+    try:
+        n = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"HOTPOTQA_STATIC_N_SAMPLES={raw!r} is not an integer"
+        ) from exc
+    if n <= 0:
+        raise ValueError(
+            f"HOTPOTQA_STATIC_N_SAMPLES must be positive, got {n}"
+        )
+    return n
+
+
 def preprocess_sample(sample: dict) -> dict:
     """Preprocess a single sample for chain execution."""
     return {

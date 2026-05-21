@@ -15,6 +15,7 @@ from problems.chains.hotpotqa.shared_config import (
     load_jsonl,
     outer_context_builder,
     preprocess_sample,
+    resolve_n_samples,
 )
 from problems.chains.hotpotqa.static.config import STATIC_CHAIN_TOPOLOGY, load_baseline
 from problems.chains.hotpotqa.utils.retrieval import batch_retrieve
@@ -114,8 +115,9 @@ def validate(chain_spec: dict) -> tuple[dict, list[dict]]:
         16,
     ) % (2**32)
     rng = random.Random(spec_seed)
-    raw_300 = rng.sample(raw_all, 300)
-    dataset = [preprocess_sample(s) for s in raw_300]
+    n_samples = resolve_n_samples(300)
+    raw_samples = rng.sample(raw_all, min(n_samples, len(raw_all)))
+    dataset = [preprocess_sample(s) for s in raw_samples]
     targets = [s[DATASET_CONFIG["target_field"]] for s in dataset]
 
     # 3. Create LLM client
@@ -168,7 +170,7 @@ def validate(chain_spec: dict) -> tuple[dict, list[dict]]:
     # 8. Collect ASI-enhanced failure cases with per-hop retrieval diagnostics
     failures = []
     for raw_s, sample, result, pred, target in zip(
-        raw_300, dataset, results, predictions, targets
+        raw_samples, dataset, results, predictions, targets
     ):
         if pred is None or normalize_text(pred) != normalize_text(str(target)):
             gold_titles = set(raw_s.get("supporting_facts", {}).get("title", []))

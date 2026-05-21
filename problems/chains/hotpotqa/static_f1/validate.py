@@ -12,6 +12,7 @@ from problems.chains.hotpotqa.shared_config import (
     load_jsonl,
     outer_context_builder,
     preprocess_sample,
+    resolve_n_samples,
 )
 from problems.chains.hotpotqa.static.config import STATIC_CHAIN_TOPOLOGY, load_baseline
 from problems.chains.hotpotqa.utils.retrieval import batch_retrieve
@@ -148,9 +149,12 @@ def validate(chain_spec: dict) -> tuple[dict, list[dict]]:
         frozen_baseline=baseline,
     )
 
-    # 2. Load fixed first-300 samples
-    raw_300 = load_jsonl(DATASET_CONFIG["train_path"])[:300]
-    dataset = [preprocess_sample(s) for s in raw_300]
+    # 2. Load the first ``n_samples`` rows of the train split. Default of
+    #    300 preserves scoring continuity with prior runs; operators tuning
+    #    wallclock-per-evaluation override via ``HOTPOTQA_STATIC_N_SAMPLES``.
+    n_samples = resolve_n_samples(300)
+    raw_samples = load_jsonl(DATASET_CONFIG["train_path"])[:n_samples]
+    dataset = [preprocess_sample(s) for s in raw_samples]
     targets = [s[DATASET_CONFIG["target_field"]] for s in dataset]
 
     # 3. Create LLM client
@@ -207,7 +211,7 @@ def validate(chain_spec: dict) -> tuple[dict, list[dict]]:
     # different signal to the mutation LLM and compounding the treatment.
     failures = []
     for raw_s, sample, result, pred, target in zip(
-        raw_300, dataset, results, predictions, targets
+        raw_samples, dataset, results, predictions, targets
     ):
         if pred is None or normalize_text(pred) != normalize_text(str(target)):
             gold_titles = set(raw_s.get("supporting_facts", {}).get("title", []))

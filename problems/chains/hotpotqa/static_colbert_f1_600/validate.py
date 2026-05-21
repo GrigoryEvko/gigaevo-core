@@ -22,6 +22,7 @@ from problems.chains.hotpotqa.shared_config import (
     load_jsonl,
     outer_context_builder,
     preprocess_sample,
+    resolve_n_samples,
 )
 from problems.chains.hotpotqa.static.config import STATIC_CHAIN_TOPOLOGY, load_baseline
 from problems.chains.hotpotqa.utils.retrieval import make_batch_tool_fn
@@ -161,9 +162,12 @@ def validate(chain_spec: dict) -> tuple[dict, list[dict]]:
         frozen_baseline=baseline,
     )
 
-    # 2. Load fixed first-600 samples
-    raw_600 = load_jsonl(DATASET_CONFIG["train_path"])[:600]
-    dataset = [preprocess_sample(s) for s in raw_600]
+    # 2. Load the first ``n_samples`` of the train split. Defaults to 600
+    #    for the ColBERT F1-600 variant; ``HOTPOTQA_STATIC_N_SAMPLES``
+    #    overrides for smoke runs.
+    n_samples = resolve_n_samples(600)
+    raw_samples = load_jsonl(DATASET_CONFIG["train_path"])[:n_samples]
+    dataset = [preprocess_sample(s) for s in raw_samples]
     targets = [s[DATASET_CONFIG["target_field"]] for s in dataset]
 
     # 3. Create LLM client
@@ -217,7 +221,7 @@ def validate(chain_spec: dict) -> tuple[dict, list[dict]]:
 
     failures = []
     for raw_s, sample, result, pred, target in zip(
-        raw_600, dataset, results, predictions, targets
+        raw_samples, dataset, results, predictions, targets
     ):
         if pred is None or normalize_text(pred) != normalize_text(str(target)):
             gold_titles = set(raw_s.get("supporting_facts", {}).get("title", []))
