@@ -32,8 +32,12 @@ def validate(result):
 
     n, m, p = 2, 4, 5
 
-    if not isinstance(rank, (int, np.integer)) or rank <= 0:
-        raise ValueError(f"Rank must be a positive integer, got {rank}")
+    # bool is a subclass of int in Python, so isinstance(True, int) is
+    # True. Reject it explicitly: a Python boolean as the rank is a
+    # type-confusion signal from the caller and should never reach the
+    # tensor reconstruction loop.
+    if isinstance(rank, bool) or not isinstance(rank, (int, np.integer)) or rank <= 0:
+        raise ValueError(f"Rank must be a positive integer, got {rank!r}")
     if rank > _MAX_RANK:
         raise ValueError(
             f"Rank {rank} exceeds trivial upper bound {_MAX_RANK} "
