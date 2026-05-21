@@ -47,6 +47,14 @@ class DagRunnerMetrics(BaseModel):
     orphaned_programs_discarded: int = 0
     dag_build_failures: int = 0
     state_update_failures: int = 0
+    # Counts of "this should have made forward progress but did not"
+    # outcomes the CLI inspects on shutdown to decide between exit 0 and
+    # exit 2. Distinct from ``dag_errors`` because individual DAG
+    # failures are an expected mode (the engine accepts/rejects them);
+    # what is *not* expected is the runner committing zero programs and
+    # exiting cleanly anyway.
+    batch_transition_failures: int = 0
+    program_not_found_errors: int = 0
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -95,6 +103,30 @@ class DagRunnerMetrics(BaseModel):
     def record_state_update_failure(self) -> None:
         self.state_update_failures += 1
         self.dag_errors += 1
+
+    def record_batch_transition_failure(self, count: int = 1) -> None:
+        """A bulk SREM/SADD against Redis failed; ``count`` programs were
+        ostensibly transitioning. The CLI surfaces a non-zero exit code
+        when this counter is non-zero and the archive did not grow,
+        on the theory that the run accomplished nothing observable."""
+        self.batch_transition_failures += count
+
+    def record_program_not_found(self) -> None:
+        """A scheduled DAG reached run time, the runner went to fetch the
+        program, and storage returned ``None`` — typically a stale ID
+        the engine queued before a Redis re-index, or a race with a
+        manual flush. Symptom: a queued program that quietly
+        evaporates."""
+        self.program_not_found_errors += 1
+
+    def has_silent_failures(self) -> bool:
+        """True if at least one counter that should never be silently
+        non-zero crossed above zero. The CLI uses this together with
+        the archive-size delta to decide between exit 0 and exit 2."""
+        return (
+            self.batch_transition_failures > 0
+            or self.program_not_found_errors > 0
+        )
 
 
 class DagRunnerConfig(BaseModel):
@@ -439,6 +471,19 @@ class DagRunner:
 
         launched: list[Program] = []
         allowed_ids = set(to_launch_ids)
+        # An mget index whose program is ``None`` means the QUEUED ID
+        # listed in the SMEMBERS index has no backing program payload —
+        # typically a stale ghost from a previous Redis layout, a
+        # half-flushed pipeline, or a race with manual cleanup. Record
+        # each one so the runner can surface "I tried to launch N but
+        # only saw K live payloads" as a non-zero exit code on shutdown.
+        for fetched, expected_id in zip(fresh, to_launch_ids):
+            if fetched is None:
+                self._metrics.record_program_not_found()
+                logger.warning(
+                    "[DagScheduler] queued program {} not found in storage",
+                    expected_id[:8],
+                )
         candidates = [p for p in fresh if p is not None]
         candidates = self._prioritizer.prioritize(candidates)
         for program in candidates:
@@ -495,6 +540,7 @@ class DagRunner:
                 logger.info("[DagScheduler] launched {} programs", count)
             except Exception:
                 logger.exception("[DagScheduler] batch mark-started failed")
+                self._metrics.record_batch_transition_failure(len(launched_ids))
                 # Cancel tasks whose state transition failed; awaiting
                 # joins each one so the loop doesn't leave half-cancelled
                 # coroutines hanging off ``_active``.
@@ -568,6 +614,7 @@ class DagRunner:
                 "[DagScheduler] batch RUNNING→DONE failed for {} programs",
                 len(batch),
             )
+            self._metrics.record_batch_transition_failure(len(batch))
 
     async def _cancel_task(self, info: TaskInfo) -> None:
         if info.task.done():

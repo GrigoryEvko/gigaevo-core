@@ -187,6 +187,33 @@ def _dump_resolved_config(cfg: ExperimentConfig) -> Path:
     corruption.
     """
     out_dir = (cfg.output_dir / cfg.experiment_id).resolve()
+    # ``output_dir`` is a free-form ``Path`` on the schema so a hostile
+    # value (``/etc/passwd`` and similar non-directory targets) reaches
+    # this site untouched. Walk up to the first existing ancestor and
+    # surface a typed message if that ancestor is not a writable
+    # directory; the low-level OSError frame from ``mkdir`` otherwise
+    # confuses an operator into chasing a stack trace instead of fixing
+    # the configuration.
+    ancestor = out_dir
+    while not ancestor.exists():
+        parent = ancestor.parent
+        if parent == ancestor:
+            raise ValueError(
+                f"output_dir {cfg.output_dir!s} has no existing ancestor; "
+                "the path appears to be unreachable from the current "
+                "filesystem root"
+            )
+        ancestor = parent
+    if not ancestor.is_dir():
+        raise ValueError(
+            f"output_dir {cfg.output_dir!s} resolves through "
+            f"{ancestor!s} which is not a directory"
+        )
+    if not os.access(ancestor, os.W_OK):
+        raise ValueError(
+            f"output_dir {cfg.output_dir!s} resolves through "
+            f"{ancestor!s} which is not writable by the current process"
+        )
     out_dir.mkdir(parents=True, exist_ok=True)
     config_path = out_dir / "config.json"
     payload = cfg.model_dump_json(indent=2)

@@ -256,3 +256,52 @@ class TestCliTyroOverride:
         # The friendly framed block should not include a Python
         # traceback header.
         assert "Traceback" not in captured.err
+
+
+class TestCliOutputDirValidation:
+    """``_dump_resolved_config`` walks up the requested ``output_dir``
+    until it finds an existing ancestor; if that ancestor is not a
+    writable directory the run aborts with a typed message instead of
+    leaking a low-level ``OSError`` frame from ``mkdir``."""
+
+    def test_output_dir_under_regular_file_rejected(
+        self, tmp_path: Path
+    ) -> None:
+        from run import main
+
+        blocker = tmp_path / "blocker"
+        blocker.write_text("not a directory")
+        exp = _make_experiment(tmp_path)
+        with pytest.raises(ValueError, match="not a directory"):
+            main(
+                [
+                    str(exp),
+                    "--dry-run",
+                    "--output-dir",
+                    str(blocker / "below"),
+                ]
+            )
+
+    def test_output_dir_under_unwritable_parent_rejected(
+        self, tmp_path: Path
+    ) -> None:
+        from run import main
+
+        readonly = tmp_path / "readonly"
+        readonly.mkdir()
+        # ``chmod 0o500`` keeps the directory readable + executable so
+        # the existence-walk succeeds but blocks new entries underneath.
+        readonly.chmod(0o500)
+        try:
+            exp = _make_experiment(tmp_path)
+            with pytest.raises(ValueError, match="not writable"):
+                main(
+                    [
+                        str(exp),
+                        "--dry-run",
+                        "--output-dir",
+                        str(readonly / "below"),
+                    ]
+                )
+        finally:
+            readonly.chmod(0o700)

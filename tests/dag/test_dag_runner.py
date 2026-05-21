@@ -118,6 +118,27 @@ class TestDagRunnerMetrics:
         assert m.state_update_failures == 1
         assert m.dag_errors == 1
 
+    def test_record_batch_transition_failure(self):
+        m = DagRunnerMetrics()
+        m.record_batch_transition_failure(3)
+        assert m.batch_transition_failures == 3
+        # dag_errors stays unchanged — silent-failure counters are
+        # tracked separately from per-DAG outcome counters.
+        assert m.dag_errors == 0
+        assert m.has_silent_failures() is True
+
+    def test_record_program_not_found(self):
+        m = DagRunnerMetrics()
+        assert m.has_silent_failures() is False
+        m.record_program_not_found()
+        m.record_program_not_found()
+        assert m.program_not_found_errors == 2
+        assert m.has_silent_failures() is True
+
+    def test_has_silent_failures_default_false(self):
+        m = DagRunnerMetrics()
+        assert m.has_silent_failures() is False
+
     def test_uptime_seconds(self):
         m = DagRunnerMetrics()
         # Freshly constructed: started_at is now-ish, so uptime stays below

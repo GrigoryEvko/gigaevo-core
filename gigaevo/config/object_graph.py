@@ -20,7 +20,6 @@ shutdown signal arrives.
 
 from __future__ import annotations
 
-import contextlib
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -287,6 +286,51 @@ async def _maybe_build_prompt_dataplane(
     return prompt_dp
 
 
+def _resolve_exit_code(
+    dag_runner: "DagRunner | None",
+    evolution_engine: "EvolutionEngine | None",
+    archive_size_before: int,
+    archive_size_after: int,
+) -> int:
+    """Return ``0`` for a clean run, ``2`` when the run finished with at
+    least one silent failure path triggered *and* the archive failed to
+    grow.
+
+    The CLI's contract: an exit of zero means "the run accomplished
+    forward progress (the archive grew) or terminated cleanly without
+    swallowing batch-transition / program-not-found errors". Any time
+    a batch-transition rejection or a stale-id event landed and the
+    archive made no net progress, the wrapper script needs to see the
+    failure — otherwise a Kubernetes scheduler treats a no-op crash as
+    a healthy completion and never restarts the run.
+    """
+    runner_silent = (
+        dag_runner is not None
+        and getattr(dag_runner, "_metrics", None) is not None
+        and dag_runner._metrics.has_silent_failures()
+    )
+    engine_silent = False
+    if evolution_engine is not None and getattr(
+        evolution_engine, "metrics", None
+    ) is not None:
+        engine_silent = (
+            getattr(evolution_engine.metrics, "batch_transition_failures", 0) > 0
+        )
+    archive_grew = archive_size_after > archive_size_before
+    if (runner_silent or engine_silent) and not archive_grew:
+        logger.warning(
+            "[run] non-zero exit: archive did not grow "
+            "(before={}, after={}) and at least one silent failure "
+            "counter fired (runner={}, engine={})",
+            archive_size_before,
+            archive_size_after,
+            runner_silent,
+            engine_silent,
+        )
+        return 2
+    return 0
+
+
 async def run_with_config(cfg: ExperimentConfig) -> int:
     """End-to-end runner the CLI invokes when not in dry-run mode.
 
@@ -359,6 +403,8 @@ async def run_with_config(cfg: ExperimentConfig) -> int:
     dataplane: DataPlane | None = None
     prompt_dataplane: DataPlane | None = None
 
+    archive_size_before = 0
+    archive_size_after = 0
     try:
         writer = _build_default_writer(cfg)
 
@@ -440,6 +486,16 @@ async def run_with_config(cfg: ExperimentConfig) -> int:
             logger.info("Loaded {} initial program(s)", len(programs))
 
         try:
+            archive_size_before = len(
+                await evolution_engine.strategy.get_program_ids()
+            )
+        except Exception:
+            # Strategy archive read can fail on a partially-initialised
+            # data plane; treat the baseline as zero so a successful
+            # later read still produces a positive delta.
+            archive_size_before = 0
+
+        try:
             dag_runner.start()
             evolution_engine.start()
             logger.info(
@@ -454,37 +510,74 @@ async def run_with_config(cfg: ExperimentConfig) -> int:
             # Idempotent stops: covers the path where something between
             # start() and serve_until_signal raises and leaves the
             # background tasks alive. stop() on an already-stopped
-            # component is a no-op.
-            with contextlib.suppress(Exception):
+            # component is a no-op. ``stop()`` returning normally is the
+            # common path; a real exception there is informative, so log
+            # it (don't swallow with ``contextlib.suppress``).
+            try:
                 await evolution_engine.stop()
-            with contextlib.suppress(Exception):
+            except Exception:
+                logger.exception("[run] evolution_engine.stop raised")
+            try:
                 await dag_runner.stop()
-        return 0
+            except Exception:
+                logger.exception("[run] dag_runner.stop raised")
+            try:
+                archive_size_after = len(
+                    await evolution_engine.strategy.get_program_ids()
+                )
+            except Exception:
+                archive_size_after = archive_size_before
+
+        return _resolve_exit_code(
+            dag_runner,
+            evolution_engine,
+            archive_size_before,
+            archive_size_after,
+        )
     except KeyboardInterrupt:
         logger.info("Interrupted by user")
-        return 0
+        return _resolve_exit_code(
+            dag_runner,
+            evolution_engine,
+            archive_size_before,
+            archive_size_after,
+        )
     except Exception:
         logger.exception("Run failed")
         raise
     finally:
         # Drain pool workers before unbinding the contextvar so late
         # exec calls during shutdown still resolve to the shared pool.
-        with contextlib.suppress(Exception):
+        # Each ``close`` / ``shutdown`` below logs at exception level so
+        # a real backend bug (Redis client double-close, transport stuck
+        # at exit, …) is discoverable, but the next teardown step still
+        # runs — order matters more than success on the shutdown path.
+        try:
             await exec_runner_pool.shutdown()
+        except Exception:
+            logger.exception("[run] exec_runner_pool.shutdown raised")
         reset_ambient_exec_runner_pool(pool_token)
         if redis_storage is not None:
-            with contextlib.suppress(Exception):
+            try:
                 await redis_storage.close()
+            except Exception:
+                logger.exception("[run] redis_storage.close raised")
         # Shutdown the coordinator after the storage so tail writes
         # storage performs during close() still see a live pool.
         if dataplane is not None:
-            with contextlib.suppress(Exception):
+            try:
                 await dataplane.shutdown()
+            except Exception:
+                logger.exception("[run] dataplane.shutdown raised")
         if prompt_dataplane is not None:
-            with contextlib.suppress(Exception):
+            try:
                 await prompt_dataplane.shutdown()
+            except Exception:
+                logger.exception("[run] prompt_dataplane.shutdown raised")
         if writer is not None:
-            with contextlib.suppress(Exception):
+            try:
                 writer.close()
+            except Exception:
+                logger.exception("[run] writer.close raised")
         duration = time.time() - start_time
         logger.info("Duration: {:.1f}s ({:.2f}h)", duration, duration / 3600)

@@ -573,6 +573,11 @@ class EvolutionEngine:
                     len(reject_ids),
                     e,
                 )
+                # ``batch_transition_failures`` is added by
+                # ``getattr`` against the EngineMetrics model which has
+                # ``extra='allow'``; surfaced on shutdown by the CLI.
+                current = getattr(self.metrics, "batch_transition_failures", 0)
+                self.metrics.batch_transition_failures = current + len(reject_ids)
 
         self.metrics.programs_processed += added
         self.metrics.record_ingestion_metrics(added, rej_valid, rej_strategy)
@@ -602,6 +607,10 @@ class EvolutionEngine:
                 "[EvolutionEngine] gen={} batch_transition_by_ids failed: {}",
                 self.metrics.total_generations,
                 e,
+            )
+            current = getattr(self.metrics, "batch_transition_failures", 0)
+            self.metrics.batch_transition_failures = current + len(
+                program_ids_to_refresh
             )
             return 0
 
