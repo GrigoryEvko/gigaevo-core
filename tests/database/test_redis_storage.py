@@ -1245,6 +1245,50 @@ class TestRecoverStrandedGhostId:
         assert f"{result:03d}" == "001"
 
 
+class TestQuarantineNonEmptyStartup:
+    """``__aenter__`` (via ``_raise_if_quarantine_non_empty``) fails fast
+    when the ``status:corrupt`` set is non-empty. The signal proves that
+    a previous run encountered schema drift and the operator must
+    reconcile the offending blobs before the engine resumes.
+    """
+
+    async def test_quarantine_non_empty_raises(self, fakeredis_storage) -> None:
+        from gigaevo.exceptions import StorageError
+
+        # Pre-seed the corrupt set so the startup check fires.
+        redis_conn = fakeredis_storage._conn._redis
+        corrupt_set = fakeredis_storage._keys.status_set("corrupt")
+        await redis_conn.sadd(corrupt_set, "pid-a", "pid-b")
+
+        with pytest.raises(StorageError, match="quarantine"):
+            await fakeredis_storage._raise_if_quarantine_non_empty()
+
+    async def test_quarantine_empty_passes(self, fakeredis_storage) -> None:
+        # Empty set: no raise.
+        await fakeredis_storage._raise_if_quarantine_non_empty()
+
+    async def test_quarantine_validation_failure_records_id(
+        self, fakeredis_storage
+    ) -> None:
+        from pydantic import ValidationError
+
+        try:
+            # Force a real ValidationError to feed the helper.
+            from gigaevo.programs.program import Program
+
+            Program(code="x", state="not_a_real_state")  # type: ignore[arg-type]
+        except ValidationError as ve:
+            await fakeredis_storage.quarantine_validation_failure(
+                "stale-pid-1", ve
+            )
+
+        redis_conn = fakeredis_storage._conn._redis
+        members = await redis_conn.smembers(
+            fakeredis_storage._keys.status_set("corrupt")
+        )
+        assert "stale-pid-1" in members
+
+
 # ===================================================================
 # Category P: batch_transition_by_ids — raw JSON patching fast path
 # ===================================================================

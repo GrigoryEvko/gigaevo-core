@@ -9,6 +9,7 @@ from types import TracebackType
 from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from loguru import logger
+from pydantic import ValidationError
 from redis import asyncio as aioredis
 from redis.exceptions import WatchError
 
@@ -135,7 +136,16 @@ class RedisProgramStorage(ProgramStorage):
     # --------------------- Context Manager ---------------------
 
     async def __aenter__(self) -> RedisProgramStorage:
-        """Acquire instance lock and start metrics collection."""
+        """Acquire instance lock and start metrics collection.
+
+        After the lock is taken we scan the ``status:corrupt`` quarantine
+        set. Records land in that set when ``recover_stranded_programs``
+        or :meth:`quarantine_validation_failure` encounters a blob that
+        survived JSON decode but failed pydantic validation. An empty
+        set is the only safe startup state; anything in it indicates
+        schema drift that the application must reconcile (migration,
+        manual cleanup, or model rollback) before the engine resumes.
+        """
         if not self.config.read_only:
             await self._lock.acquire()
         # Ensure connection is established and the background reconciler
@@ -145,7 +155,63 @@ class RedisProgramStorage(ProgramStorage):
         await self._conn.get()
         self._conn.start_reconciler()
         self._metrics.start()
+        await self._raise_if_quarantine_non_empty()
         return self
+
+    async def _raise_if_quarantine_non_empty(self) -> None:
+        """Raise :class:`StorageError` if any records sit in ``status:corrupt``.
+
+        The check runs once at startup. Production code that hits a
+        ValidationError while reading a blob (schema drift) routes the
+        id into ``status:corrupt`` so the next process restart fails
+        fast instead of silently dropping the record.
+        """
+        try:
+            ids = await self.get_ids_by_status("corrupt")
+        except Exception as exc:  # noqa: BLE001 - startup boundary
+            logger.warning(
+                "[RedisProgramStorage] could not probe quarantine set: {}",
+                sanitize_for_log(str(exc)),
+            )
+            return
+        if not ids:
+            return
+        sample = ", ".join(sorted(ids)[:5])
+        raise StorageError(
+            f"Schema-drift quarantine non-empty: {len(ids)} program id(s) "
+            f"in {self._keys.status_set('corrupt')!r} (e.g. {sample}). "
+            f"Inspect the offending blobs, then SREM the ids from the "
+            f"set once reconciled to resume."
+        )
+
+    async def quarantine_validation_failure(
+        self, program_id: str, error: ValidationError
+    ) -> None:
+        """Move ``program_id`` into ``status:corrupt`` after a schema-drift read.
+
+        Used by call sites that read a blob with the ``on_validation_error``
+        hook on :meth:`_safe_deserialize`. SADD is idempotent: requeuing
+        the same id is a no-op. The blob itself is preserved.
+        """
+        if not program_id or self.config.read_only:
+            return
+
+        async def _quarantine(r: aioredis.Redis) -> None:
+            await r.sadd(self._keys.status_set("corrupt"), program_id)
+
+        try:
+            await self._conn.execute("quarantine_validation", _quarantine)
+        except Exception as exc:  # noqa: BLE001 - boundary
+            logger.warning(
+                "[RedisProgramStorage] could not quarantine {}: {}",
+                program_id,
+                sanitize_for_log(str(exc)),
+            )
+        logger.warning(
+            "[RedisProgramStorage] Schema-drift quarantined program {}: {}",
+            program_id,
+            sanitize_for_log(str(error)),
+        )
 
     async def __aexit__(
         self,
@@ -221,7 +287,21 @@ class RedisProgramStorage(ProgramStorage):
         ctx: str,
         *,
         exclude: frozenset[str] | None = None,
+        on_validation_error: Callable[[str | None, ValidationError], None]
+        | None = None,
     ) -> Program | None:
+        """Parse a stored blob into a :class:`Program`.
+
+        Returns ``None`` on any failure; callers treat that as
+        "skip this record". When ``on_validation_error`` is supplied
+        and the failure is a pydantic ``ValidationError`` (schema drift
+        after a successful JSON parse), the callback is invoked with
+        the program id extracted from the blob (best effort) and the
+        original exception so the caller can route the record to a
+        quarantine bucket. Decode errors and non-validation exceptions
+        still produce the ``None`` return without invoking the hook.
+        """
+        data: Any = None
         try:
             data = _loads(raw)
             if isinstance(data, dict):
@@ -234,6 +314,28 @@ class RedisProgramStorage(ProgramStorage):
                         data[fname] = {}
                 cls._coerce_nested_empty_to_list(data)
             return Program.from_dict(data, exclude=exclude)
+        except ValidationError as ve:
+            pid_from_blob: str | None = None
+            if isinstance(data, dict):
+                raw_pid = data.get("id")
+                pid_from_blob = (
+                    str(raw_pid) if isinstance(raw_pid, str) else None
+                )
+            logger.warning(
+                "[RedisProgramStorage] Schema-drift in {} (pid={}): {}",
+                ctx,
+                pid_from_blob or "<unknown>",
+                sanitize_for_log(str(ve)),
+            )
+            if on_validation_error is not None:
+                try:
+                    on_validation_error(pid_from_blob, ve)
+                except Exception as cb_err:  # noqa: BLE001 - boundary
+                    logger.warning(
+                        "[RedisProgramStorage] quarantine callback raised: {}",
+                        sanitize_for_log(str(cb_err)),
+                    )
+            return None
         except Exception as e:
             logger.warning(
                 "[RedisProgramStorage] Corrupt data in {}: {}",

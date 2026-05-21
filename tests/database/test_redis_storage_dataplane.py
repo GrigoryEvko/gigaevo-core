@@ -440,6 +440,49 @@ class TestSafeDeserializeNoRename:
         assert prog.lineage.parents == [] and isinstance(prog.lineage.parents, list)
         assert prog.lineage.children == [] and isinstance(prog.lineage.children, list)
 
+    def test_validation_error_invokes_quarantine_callback(self) -> None:
+        """``_safe_deserialize`` routes a ValidationError through the
+        ``on_validation_error`` hook with the pid extracted from the
+        blob and the original exception. JSON-decode failures bypass
+        the hook (they aren't schema drift, just transport corruption).
+        """
+        from gigaevo.utils.json import dumps as _dumps
+
+        # Schema-drift sample: ``state`` field carries a non-enum value.
+        blob = {
+            "id": str(uuid.uuid4()),
+            "code": "def f(): pass",
+            "state": "not_a_real_state",
+            "atomic_counter": 1,
+        }
+        raw = _dumps(blob)
+        captured: list[tuple[str | None, str]] = []
+
+        def hook(pid: str | None, ve) -> None:
+            captured.append((pid, type(ve).__name__))
+
+        prog = RedisProgramStorage._safe_deserialize(
+            raw, ctx="schema-drift", on_validation_error=hook
+        )
+        assert prog is None
+        assert len(captured) == 1
+        assert captured[0][0] == blob["id"]
+        assert captured[0][1] == "ValidationError"
+
+    def test_json_decode_error_bypasses_quarantine_callback(self) -> None:
+        """A malformed JSON blob is not schema drift; the quarantine
+        hook is never invoked because there is no id to route."""
+        captured: list[tuple[str | None, str]] = []
+
+        def hook(pid: str | None, ve) -> None:
+            captured.append((pid, type(ve).__name__))
+
+        prog = RedisProgramStorage._safe_deserialize(
+            "{not valid", ctx="garbled", on_validation_error=hook
+        )
+        assert prog is None
+        assert captured == []
+
     def test_lineage_populated_list_preserved(self) -> None:
         """Non-empty list fields are not touched by the coercion: the
         coercion only fires on empty ``dict`` values."""
