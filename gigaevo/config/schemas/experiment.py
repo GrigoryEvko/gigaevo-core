@@ -37,9 +37,16 @@ class ExperimentConfig(FrozenStrictModel):
         pattern=r"^[a-zA-Z0-9_\-]+$",
         description="Short experiment identifier; ASCII letters, digits, underscores, and hyphens only.",
     )
+    # ``seed`` is currently retained on the schema for forwards
+    # compatibility — no runtime consumer reads it today. Bounding the
+    # field to the 32-bit unsigned range (the value range numpy/torch
+    # RNGs accept without truncation) shields downstream callers from
+    # overflow when the field is wired up.
     seed: int = Field(
         default=42,
-        description="Master RNG seed propagated to mutation and evaluation.",
+        ge=0,
+        le=(2**32) - 1,
+        description="Master RNG seed reserved for downstream wiring; currently unused at runtime.",
     )
     output_dir: Path = Field(
         default_factory=lambda: Path("outputs"),
@@ -51,15 +58,35 @@ class ExperimentConfig(FrozenStrictModel):
     def _output_dir_not_empty_or_cwd(cls, value: Path) -> Path:
         return reject_empty_or_cwd_path("output_dir", value)  # type: ignore[return-value]
 
-    redis: RedisConfig
-    dataplane: DataPlaneSettings
-    problem: ProblemConfig
-    algorithm: AlgorithmConfig
-    engine: EngineConfig
-    pipeline: PipelineConfig
-    llm: LLMConfig
-    runner: DAGRunnerConfig = Field(default_factory=DAGRunnerConfig)
-    prompt_fetcher: PromptFetcherConfig | None = None
+    redis: RedisConfig = Field(
+        description="Redis connection coordinates for program storage and dataplane backing.",
+    )
+    dataplane: DataPlaneSettings = Field(
+        description="DataPlane coordinator tunables; key_prefix must match the experiment name.",
+    )
+    problem: ProblemConfig = Field(
+        description="Pointer to the problem directory and optional fitness-metric overrides.",
+    )
+    algorithm: AlgorithmConfig = Field(
+        description="MAP-Elites algorithm shape: single- or multi-island plus per-island policies.",
+    )
+    engine: EngineConfig = Field(
+        description="Evolution engine variant (generational, steady-state, or bus) and shared loop knobs.",
+    )
+    pipeline: PipelineConfig = Field(
+        description="Pipeline builder choice that wires per-program evaluation stages.",
+    )
+    llm: LLMConfig = Field(
+        description="LLM routing config (single model, ensemble, or bandit) used by mutation prompts.",
+    )
+    runner: DAGRunnerConfig = Field(
+        default_factory=DAGRunnerConfig,
+        description="DAG runner tuning (poll interval, concurrency caps, DAG timeout).",
+    )
+    prompt_fetcher: PromptFetcherConfig | None = Field(
+        default=None,
+        description="Optional prompt-source override; None uses the per-problem default fetcher.",
+    )
 
     @model_validator(mode="after")
     def _redis_coords_match_dataplane(self) -> ExperimentConfig:

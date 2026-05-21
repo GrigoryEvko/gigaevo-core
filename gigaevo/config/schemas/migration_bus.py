@@ -4,7 +4,11 @@ from typing import TYPE_CHECKING, Annotated, Literal
 
 from pydantic import Field, model_validator
 
-from gigaevo.config.schemas._base import FrozenStrictModel
+from gigaevo.config.schemas._base import (
+    FinitePositiveFloat,
+    FrozenStrictModel,
+    NonBlankStr,
+)
 
 if TYPE_CHECKING:
     from gigaevo.evolution.bus.node import MigrationNode
@@ -32,7 +36,7 @@ class RingTopologyConfig(FrozenStrictModel):
     wraps around so the first run accepts from the last."""
 
     kind: Literal["ring"] = "ring"
-    run_ids: list[str] = Field(
+    run_ids: list[NonBlankStr] = Field(
         min_length=2,
         description="Ring order; each run accepts migrants only from its predecessor, wrapping around.",
     )
@@ -63,15 +67,15 @@ class RedisStreamTransportConfig(FrozenStrictModel):
     surface; ``run_id`` and ``stream_key`` are required because they
     encode the experiment identity and the cross-run namespace."""
 
-    run_id: str = Field(
+    run_id: NonBlankStr = Field(
         min_length=1,
         description="Local run identity stamped on every published envelope.",
     )
-    stream_key: str = Field(
+    stream_key: NonBlankStr = Field(
         min_length=1,
         description="Redis Stream name carrying the cross-run migration traffic.",
     )
-    host: str = Field(
+    host: NonBlankStr = Field(
         default="localhost",
         min_length=1,
         description="Redis hostname for the migration-bus DB.",
@@ -82,24 +86,33 @@ class RedisStreamTransportConfig(FrozenStrictModel):
         le=65535,
         description="Redis TCP port for the migration-bus DB.",
     )
+    # Standard Redis ships sixteen logical databases (0-15); see RedisConfig.
     db: int = Field(
         default=15,
         ge=0,
-        description="Redis DB index reserved for the migration stream.",
+        le=15,
+        description="Redis DB index reserved for the migration stream (0-15).",
     )
+    # 10 million stream entries already exceeds Redis memory on standard
+    # configurations; the ceiling rejects typo-driven runaway streams.
     max_stream_len: int = Field(
         default=1000,
         ge=1,
+        le=10_000_000,
         description="Maximum entries retained on the Redis Stream before trimming.",
     )
+    # 24-hour ceiling: any longer SETNX lease is effectively "no lease".
     claim_ttl: int = Field(
         default=120,
         ge=1,
+        le=86_400,
         description="SETNX claim lease in seconds before an unconsumed envelope becomes available again.",
     )
+    # 1-hour ceiling on XREAD blocking: longer blocks defeat shutdown.
     block_ms: int = Field(
         default=5000,
         ge=0,
+        le=3_600_000,
         description="XREAD BLOCK timeout in milliseconds when polling the stream.",
     )
 
@@ -134,20 +147,23 @@ class MigrationBusConfig(FrozenStrictModel):
     parameter of ``BusedEvolutionEngine`` (not ``MigrationNode``) and
     lives on :class:`BusedEngineConfig`."""
 
-    run_id: str = Field(
+    run_id: NonBlankStr = Field(
         min_length=1,
         description="Local run identity; must match transport.run_id.",
     )
-    transport: RedisStreamTransportConfig
-    topology: TopologyConfig
+    transport: RedisStreamTransportConfig = Field(
+        description="Wire-level transport (Redis Streams) that ships migration envelopes.",
+    )
+    topology: TopologyConfig = Field(
+        description="Acceptance filter (bus / ring) that decides which peer runs are upstream of this one.",
+    )
     max_buffer_size: int = Field(
         default=50,
         ge=1,
         description="Capacity of the in-process buffer holding consumed but not yet ingested migrants.",
     )
-    consume_interval: float = Field(
+    consume_interval: FinitePositiveFloat = Field(
         default=5.0,
-        gt=0.0,
         description="Seconds between background polls of the migration stream.",
     )
     max_consume_per_poll: int = Field(

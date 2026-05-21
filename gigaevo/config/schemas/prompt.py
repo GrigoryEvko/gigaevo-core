@@ -5,7 +5,12 @@ from typing import TYPE_CHECKING, Annotated, Literal
 
 from pydantic import Field, field_validator
 
-from gigaevo.config.schemas._base import FrozenStrictModel, reject_empty_or_cwd_path
+from gigaevo.config.schemas._base import (
+    FinitePositiveFloat,
+    FrozenStrictModel,
+    NonBlankStr,
+    reject_empty_or_cwd_path,
+)
 
 if TYPE_CHECKING:
     from gigaevo.prompts.fetcher import PromptFetcher
@@ -56,28 +61,30 @@ class GigaEvoArchivePromptFetcherConfig(FrozenStrictModel):
     kind: Literal["coevolved"] = "coevolved"
     prompt_redis_db: int = Field(
         ge=0,
-        description="Redis DB index of the paired prompt-evolution run the fetcher reads from.",
+        le=15,
+        description="Redis DB index of the paired prompt-evolution run the fetcher reads from (0-15).",
     )
-    main_redis_prefix: str = Field(
+    main_redis_prefix: NonBlankStr = Field(
         min_length=1,
         description="Key prefix under which this run writes outcome stats for the prompt run to score.",
     )
     main_redis_db: int | None = Field(
         default=None,
         ge=0,
-        description="Redis DB index of this run; None disables outcome-stat writeback.",
+        le=15,
+        description="Redis DB index of this run (0-15); None disables outcome-stat writeback.",
     )
-    prompt_prefix: str = Field(
+    prompt_prefix: NonBlankStr = Field(
         default="prompt_evolution",
         min_length=1,
         description="Key prefix the prompt-evolution run uses on its side.",
     )
-    archive_prefix: str = Field(
+    archive_prefix: NonBlankStr = Field(
         default="island_fitness_island",
         min_length=1,
         description="Sub-key under prompt_prefix where the current champion lives.",
     )
-    host: str = Field(
+    host: NonBlankStr = Field(
         default="localhost",
         min_length=1,
         description="Hostname of the Redis server that backs both runs.",
@@ -88,16 +95,15 @@ class GigaEvoArchivePromptFetcherConfig(FrozenStrictModel):
         le=65535,
         description="TCP port of the Redis server.",
     )
-    cache_ttl_seconds: float = Field(
+    cache_ttl_seconds: FinitePositiveFloat = Field(
         default=30.0,
-        gt=0.0,
         description="Seconds the fetcher caches the champion before re-reading.",
     )
     fallback_prompts_dir: Path | None = Field(
         default=None,
         description="Directory of static prompts used until the first champion is available.",
     )
-    fitness_key: str = Field(
+    fitness_key: NonBlankStr = Field(
         default="fitness",
         min_length=1,
         description="Metric the prompt-run archive ranks champions by.",

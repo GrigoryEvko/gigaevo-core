@@ -6,7 +6,14 @@ into ``ExperimentConfig`` — the single root the CLI loads and
 validates.
 """
 
-from gigaevo.config.schemas._base import FrozenStrictModel
+from gigaevo.config.schemas._base import (
+    FiniteFloat,
+    FiniteNonNegativeFloat,
+    FinitePositiveFloat,
+    FrozenStrictModel,
+    NoControlCharsStr,
+    NonBlankStr,
+)
 from gigaevo.config.schemas.algorithm import (
     AlgorithmConfig,
     ArchiveRemoverConfig,
@@ -114,6 +121,9 @@ __all__ = [
     "ExperimentConfig",
     "FIFOConfig",
     "FeatureExtractorConfig",
+    "FiniteFloat",
+    "FiniteNonNegativeFloat",
+    "FinitePositiveFloat",
     "FixedDirPromptFetcherConfig",
     "FitnessArchiveRemoverConfig",
     "FitnessProportionalEliteSelectorConfig",
@@ -128,6 +138,8 @@ __all__ = [
     "MigrantSelectorConfig",
     "MigrationBusConfig",
     "MultiIslandConfig",
+    "NoControlCharsStr",
+    "NonBlankStr",
     "OptunaOptPipelineBuilderConfig",
     "ParentSelectorConfig",
     "PipelineBuilderConfig",

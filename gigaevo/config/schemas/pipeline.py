@@ -3,9 +3,14 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 
-from gigaevo.config.schemas._base import FrozenStrictModel, reject_empty_or_cwd_path
+from gigaevo.config.schemas._base import (
+    FinitePositiveFloat,
+    FrozenStrictModel,
+    NonBlankStr,
+    reject_empty_or_cwd_path,
+)
 
 if TYPE_CHECKING:
     from gigaevo.entrypoint.default_pipelines import PipelineBuilder
@@ -22,10 +27,14 @@ class _PipelineBuilderBase(FrozenStrictModel):
     :data:`gigaevo.config.defaults.DEFAULT_DAG_TIMEOUT_S` so direct
     schema construction matches the pipeline preset builders."""
 
-    dag_timeout: float = Field(
+    # The ``le`` ceiling (30 days) lets long-running LLM batches finish
+    # while still rejecting infinity, ``sys.float_info.max`` and other
+    # accidental "no-timeout" values that would silently disable the
+    # DAG-level wall-clock guard.
+    dag_timeout: FinitePositiveFloat = Field(
         default=7200.0,
-        gt=0.0,
-        description="Wall-clock cap in seconds for the full program-evaluation DAG.",
+        le=2_592_000.0,
+        description="Wall-clock cap in seconds for the full program-evaluation DAG (max 30 days).",
     )
 
 
@@ -43,11 +52,21 @@ class DefaultPipelineBuilderConfig(_PipelineBuilderBase):
     :data:`gigaevo.config.defaults.DEFAULT_STAGE_TIMEOUT_S`."""
 
     kind: Literal["default"] = "default"
-    stage_timeout: float = Field(
+    stage_timeout: FinitePositiveFloat = Field(
         default=2400.0,
-        gt=0.0,
-        description="Wall-clock cap in seconds applied to each individual stage.",
+        le=2_592_000.0,
+        description="Wall-clock cap in seconds applied to each individual stage (max 30 days).",
     )
+
+    @model_validator(mode="after")
+    def _stage_below_dag(self) -> DefaultPipelineBuilderConfig:
+        if self.stage_timeout > self.dag_timeout:
+            raise ValueError(
+                f"stage_timeout ({self.stage_timeout}s) must not exceed "
+                f"dag_timeout ({self.dag_timeout}s); a per-stage budget "
+                "wider than the whole-DAG budget cannot fire."
+            )
+        return self
 
     def build(self, ctx: EvolutionContext) -> PipelineBuilder:
         from gigaevo.entrypoint.default_pipelines import DefaultPipelineBuilder
@@ -136,11 +155,21 @@ class AutoPipelineBuilderConfig(_PipelineBuilderBase):
     matches :data:`gigaevo.config.defaults.DEFAULT_STAGE_TIMEOUT_S`."""
 
     kind: Literal["auto"] = "auto"
-    stage_timeout: float = Field(
+    stage_timeout: FinitePositiveFloat = Field(
         default=2400.0,
-        gt=0.0,
-        description="Per-stage timeout consulted only when the default branch is chosen.",
+        le=2_592_000.0,
+        description="Per-stage timeout consulted only when the default branch is chosen (max 30 days).",
     )
+
+    @model_validator(mode="after")
+    def _stage_below_dag(self) -> AutoPipelineBuilderConfig:
+        if self.stage_timeout > self.dag_timeout:
+            raise ValueError(
+                f"stage_timeout ({self.stage_timeout}s) must not exceed "
+                f"dag_timeout ({self.dag_timeout}s); a per-stage budget "
+                "wider than the whole-DAG budget cannot fire."
+            )
+        return self
 
     def build(self, ctx: EvolutionContext) -> PipelineBuilder:
         from gigaevo.entrypoint.default_pipelines import (
@@ -170,7 +199,7 @@ class ProblemSpecificPipelineBuilderConfig(_PipelineBuilderBase):
     the experiment selects this variant."""
 
     kind: Literal["problem_specific"] = "problem_specific"
-    builder_path: str = Field(
+    builder_path: NonBlankStr = Field(
         min_length=1,
         description="Fully-qualified dotted import path of the PipelineBuilder class to instantiate.",
     )
@@ -213,7 +242,9 @@ class PipelineConfig(FrozenStrictModel):
     EvolutionContext is constructed by ``build_object_graph`` from the
     other resolved subtrees and passed to ``builder.build()``."""
 
-    builder: PipelineBuilderConfig
+    builder: PipelineBuilderConfig = Field(
+        description="Discriminated builder configuration that constructs the runtime PipelineBuilder.",
+    )
     prompts_dir: Path | None = Field(
         default=None,
         description="Override the prompts directory; None uses the package defaults under gigaevo/prompts/.",

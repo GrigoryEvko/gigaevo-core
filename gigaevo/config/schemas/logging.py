@@ -5,7 +5,12 @@ from typing import TYPE_CHECKING, Annotated, Literal
 
 from pydantic import Field, field_validator
 
-from gigaevo.config.schemas._base import FrozenStrictModel, reject_empty_or_cwd_path
+from gigaevo.config.schemas._base import (
+    FinitePositiveFloat,
+    FrozenStrictModel,
+    NonBlankStr,
+    reject_empty_or_cwd_path,
+)
 
 if TYPE_CHECKING:
     from gigaevo.utils.trackers.composite import CompositeLogger
@@ -33,12 +38,12 @@ class LoggingSettings(FrozenStrictModel):
         default=None,
         description="Directory for log files; None defers to output_dir/experiment_id/.",
     )
-    rotation: str = Field(
+    rotation: NonBlankStr = Field(
         default="50 MB",
         min_length=1,
         description="Loguru rotation specifier; size or time string accepted by loguru.add.",
     )
-    retention: str = Field(
+    retention: NonBlankStr = Field(
         default="30 days",
         min_length=1,
         description="Loguru retention specifier controlling how long rotated logs are kept.",
@@ -59,14 +64,17 @@ class TBTrackerConfig(FrozenStrictModel):
     logdir: Path = Field(
         description="Directory the TensorBoard SummaryWriter writes event files into.",
     )
+    # The queue caps below match the runtime ring buffer: 2**20 entries
+    # is ~1 GB at typical metric-row sizes, well past any realistic
+    # write rate, and rejects "millions of millions" typo values.
     queue_size: int = Field(
         default=8192,
         ge=1,
+        le=1_048_576,
         description="Async write queue capacity; the writer drops events when full.",
     )
-    flush_secs: float = Field(
+    flush_secs: FinitePositiveFloat = Field(
         default=3.0,
-        gt=0.0,
         description="Background flush interval in seconds.",
     )
 
@@ -87,7 +95,7 @@ class WandBTrackerConfig(FrozenStrictModel):
     optional."""
 
     kind: Literal["wandb"] = "wandb"
-    project: str = Field(
+    project: NonBlankStr = Field(
         min_length=1,
         description="Weights & Biases project name.",
     )
@@ -114,11 +122,11 @@ class WandBTrackerConfig(FrozenStrictModel):
     queue_size: int = Field(
         default=8192,
         ge=1,
+        le=1_048_576,
         description="Async write queue capacity; the writer drops events when full.",
     )
-    flush_secs: float = Field(
+    flush_secs: FinitePositiveFloat = Field(
         default=3.0,
-        gt=0.0,
         description="Background flush interval in seconds.",
     )
 
@@ -147,12 +155,12 @@ class RedisMetricsTrackerConfig(FrozenStrictModel):
     FIFO history."""
 
     kind: Literal["redis"] = "redis"
-    redis_url: str = Field(
+    redis_url: NonBlankStr = Field(
         default="redis://localhost:6379/0",
         min_length=1,
         description="Full redis:// URL the tracker writes metrics to.",
     )
-    key_prefix: str = Field(
+    key_prefix: NonBlankStr = Field(
         default="gigaevo:metrics",
         min_length=1,
         description="Redis key prefix under which metric streams are stored.",
@@ -161,9 +169,13 @@ class RedisMetricsTrackerConfig(FrozenStrictModel):
         default=True,
         description="When true the tracker retains a per-metric FIFO history.",
     )
+    # 10 million per-metric samples already exceeds Redis memory on
+    # standard configurations; the ceiling rejects typo-driven runaway
+    # history sizes without constraining production workloads.
     max_history_per_metric: int = Field(
         default=10_000,
         ge=1,
+        le=10_000_000,
         description="Maximum samples retained per metric when history is enabled.",
     )
     max_connections: int = Field(
@@ -171,7 +183,7 @@ class RedisMetricsTrackerConfig(FrozenStrictModel):
         ge=1,
         description="Upper bound on the tracker's Redis connection pool.",
     )
-    socket_timeout: float = Field(
+    socket_timeout: FinitePositiveFloat = Field(
         default=5.0,
         ge=0.1,
         description="Per-operation socket timeout in seconds.",
@@ -179,11 +191,11 @@ class RedisMetricsTrackerConfig(FrozenStrictModel):
     queue_size: int = Field(
         default=8192,
         ge=1,
+        le=1_048_576,
         description="Async write queue capacity; the writer drops events when full.",
     )
-    flush_secs: float = Field(
+    flush_secs: FinitePositiveFloat = Field(
         default=3.0,
-        gt=0.0,
         description="Background flush interval in seconds.",
     )
 
@@ -224,7 +236,10 @@ class LoggingConfig(FrozenStrictModel):
     that matches production deployments where the Redis backend is
     the canonical write-and-discard path."""
 
-    settings: LoggingSettings = Field(default_factory=lambda: LoggingSettings())
+    settings: LoggingSettings = Field(
+        default_factory=lambda: LoggingSettings(),
+        description="File-logger knobs (level, log directory, rotation, retention) forwarded to loguru.",
+    )
     trackers: list[TrackerConfig] = Field(
         min_length=1,
         description="One or more metric tracker backends; the writer fans events out to each.",

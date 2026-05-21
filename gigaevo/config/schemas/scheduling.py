@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING, Annotated, Literal
 
 from pydantic import Field
 
-from gigaevo.config.schemas._base import FrozenStrictModel
+from gigaevo.config.schemas._base import FinitePositiveFloat, FrozenStrictModel
 
 if TYPE_CHECKING:
     from gigaevo.evolution.scheduling.feature_extractor import FeatureExtractor
@@ -56,9 +56,8 @@ class SimpleHeuristicPredictorConfig(FrozenStrictModel):
     ``default_rate``."""
 
     kind: Literal["simple_heuristic"] = "simple_heuristic"
-    default_rate: float = Field(
+    default_rate: FinitePositiveFloat = Field(
         default=0.1,
-        gt=0.0,
         description="Cold-start tokens-per-second rate used before any observations land.",
     )
     window_size: int = Field(
@@ -85,7 +84,8 @@ class RidgePredictorConfig(FrozenStrictModel):
 
     kind: Literal["ridge"] = "ridge"
     feature_extractor: FeatureExtractorConfig = Field(
-        default_factory=lambda: CodeFeatureExtractorConfig()
+        default_factory=lambda: CodeFeatureExtractorConfig(),
+        description="Featuriser that converts a program into the vector consumed by the ridge model.",
     )
     buffer_size: int = Field(
         default=500,
@@ -97,14 +97,12 @@ class RidgePredictorConfig(FrozenStrictModel):
         ge=1,
         description="Minimum samples required before the ridge model replaces the cold-start prediction.",
     )
-    default_prediction: float = Field(
+    default_prediction: FinitePositiveFloat = Field(
         default=300.0,
-        gt=0.0,
         description="Cold-start eval-time estimate in seconds before min_samples is reached.",
     )
-    alpha: float = Field(
+    alpha: FinitePositiveFloat = Field(
         default=1.0,
-        gt=0.0,
         description="L2 regularisation strength passed to sklearn Ridge.",
     )
 
@@ -148,7 +146,8 @@ class LPTConfig(FrozenStrictModel):
 
     kind: Literal["lpt"] = "lpt"
     eval_predictor: PredictorConfig = Field(
-        default_factory=lambda: SimpleHeuristicPredictorConfig()
+        default_factory=lambda: SimpleHeuristicPredictorConfig(),
+        description="Predictor that estimates eval time for ordering candidates by longest-first.",
     )
 
     def build(self) -> ProgramPrioritizer:

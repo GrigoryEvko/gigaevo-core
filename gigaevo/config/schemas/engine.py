@@ -4,7 +4,11 @@ from typing import TYPE_CHECKING, Annotated, Literal
 
 from pydantic import Field
 
-from gigaevo.config.schemas._base import FrozenStrictModel
+from gigaevo.config.schemas._base import (
+    FinitePositiveFloat,
+    FrozenStrictModel,
+    NonBlankStr,
+)
 from gigaevo.config.schemas.migration_bus import MigrationBusConfig
 
 if TYPE_CHECKING:
@@ -72,7 +76,7 @@ class StandardAcceptorConfig(FrozenStrictModel):
         default=None,
         description="Override the keys an accepted program must declare; None defers to the algorithm subtree.",
     )
-    validity_key: str | None = Field(
+    validity_key: NonBlankStr | None = Field(
         default=None,
         min_length=1,
         description="Metric name signaling program validity; None uses the canonical VALIDITY_KEY constant.",
@@ -114,36 +118,47 @@ class _EngineConfigBase(FrozenStrictModel):
     so direct schema construction yields the same shape as
     :func:`gigaevo.config.engine_presets.build_generational`."""
 
-    loop_interval: float = Field(
+    loop_interval: FinitePositiveFloat = Field(
         default=1.0,
-        gt=0.0,
         description="Seconds between engine loop ticks.",
     )
+    # The per-generation caps are bounded above by a sanity ceiling that
+    # would still allow ~100k programs per generation; values beyond that
+    # exhaust Redis well before they exhaust the engine and are almost
+    # always a typo (zeros stripped, scientific notation misread).
     max_elites_per_generation: int = Field(
         default=5,
         gt=0,
+        le=100_000,
         description="Maximum elites drawn from the archive per generation.",
     )
     max_mutations_per_generation: int = Field(
         default=8,
         gt=0,
+        le=100_000,
         description="Hard cap on mutations enqueued per generation.",
     )
-    metrics_collection_interval: float = Field(
+    metrics_collection_interval: FinitePositiveFloat = Field(
         default=1.0,
-        gt=0.0,
         description="Seconds between engine-side metric snapshots.",
     )
+    # ``max_generations`` is bounded at 10**9 — a one-second-per-generation
+    # run at that ceiling already lasts ~31 years, so the cap rejects
+    # only what would have been a runaway integer-overflow risk in the
+    # downstream counter while leaving every realistic schedule alone.
     max_generations: int | None = Field(
         default=None,
         ge=1,
+        le=1_000_000_000,
         description="Stop after this many generations; None runs indefinitely.",
     )
     parent_selector: ParentSelectorConfig = Field(
-        default_factory=lambda: RandomParentSelectorConfig(num_parents=1)
+        default_factory=lambda: RandomParentSelectorConfig(num_parents=1),
+        description="Policy that picks elite parents off the archive for mutation.",
     )
     program_acceptor: AcceptorConfig = Field(
-        default_factory=lambda: StandardAcceptorConfig()
+        default_factory=lambda: StandardAcceptorConfig(),
+        description="Composite predicate that decides whether a mutated program is admitted to the archive.",
     )
 
 
@@ -181,9 +196,13 @@ class SteadyStateEngineConfig(_EngineConfigBase):
     # ``max_in_flight=8`` mirrors the
     # ``gigaevo.config.engine_presets._STEADY_STATE_MAX_IN_FLIGHT``
     # preset constant tuned for ~3-4 GPU servers with 4 concurrent runs.
+    # ``max_in_flight`` is cross-validated against
+    # ``max_mutations_per_generation`` on the experiment root, so the
+    # same 100_000 ceiling applies here.
     max_in_flight: int = Field(
         default=8,
         gt=0,
+        le=100_000,
         description="Upper bound on in-flight DAG executions; applies backpressure to the mutation loop.",
     )
 
@@ -223,10 +242,13 @@ class BusedEngineConfig(_EngineConfigBase):
     bookkeeping to propagate."""
 
     kind: Literal["bus"] = "bus"
-    migration_bus: MigrationBusConfig
+    migration_bus: MigrationBusConfig = Field(
+        description="Cross-run migration coordinator wrapping the engine with publish/consume hooks.",
+    )
     max_imports_per_generation: int = Field(
         default=10,
         ge=1,
+        le=100_000,
         description="Upper bound on migrants drained from the bus per generation step.",
     )
 

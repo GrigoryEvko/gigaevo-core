@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING, Annotated, Literal
 
 from pydantic import Field, model_validator
 
-from gigaevo.config.schemas._base import FrozenStrictModel
+from gigaevo.config.schemas._base import (
+    FiniteNonNegativeFloat,
+    FinitePositiveFloat,
+    FrozenStrictModel,
+    NonBlankStr,
+)
 
 if TYPE_CHECKING:
     from gigaevo.database.redis_program_storage import RedisProgramStorage
@@ -48,9 +54,8 @@ class BehaviorSpaceConfig(FrozenStrictModel):
         default=True,
         description="When true the runtime expands bounds adaptively past the declared limits.",
     )
-    expansion_buffer_ratio: float = Field(
+    expansion_buffer_ratio: FiniteNonNegativeFloat = Field(
         default=0.1,
-        ge=0.0,
         description="Fractional headroom applied to dynamic bound expansion on each grow event.",
     )
 
@@ -66,10 +71,21 @@ class BehaviorSpaceConfig(FrozenStrictModel):
                 raise ValueError(
                     f"{name} length ({len(value)}) must equal keys length ({n})"
                 )
+        if len(set(self.keys)) != n:
+            raise ValueError(
+                f"behavior-space keys must be unique; got {self.keys!r}"
+            )
         for i, (lo, hi) in enumerate(self.bounds):
-            if lo > hi:
+            if not (math.isfinite(lo) and math.isfinite(hi)):
                 raise ValueError(
-                    f"bounds[{i}] invalid: min ({lo}) > max ({hi}) for key {self.keys[i]!r}"
+                    f"bounds[{i}] for key {self.keys[i]!r} must be finite; "
+                    f"got ({lo}, {hi})"
+                )
+            if not lo < hi:
+                raise ValueError(
+                    f"bounds[{i}] for key {self.keys[i]!r}: min ({lo}) must be "
+                    f"strictly less than max ({hi}); a zero-width or inverted "
+                    "interval produces no bins"
                 )
         for i, r in enumerate(self.resolutions):
             if r <= 0:
@@ -121,7 +137,7 @@ class SumArchiveSelectorConfig(FrozenStrictModel):
     across every shipped algorithm preset."""
 
     kind: Literal["sum"] = "sum"
-    fitness_keys: list[str] = Field(
+    fitness_keys: list[NonBlankStr] = Field(
         min_length=1,
         description="Metric keys whose values are summed (with sign) to rank archive entries.",
     )
@@ -135,6 +151,10 @@ class SumArchiveSelectorConfig(FrozenStrictModel):
         if len(self.fitness_keys) != len(self.fitness_key_higher_is_better):
             raise ValueError(
                 "fitness_keys and fitness_key_higher_is_better lengths must match"
+            )
+        if len(set(self.fitness_keys)) != len(self.fitness_keys):
+            raise ValueError(
+                f"fitness_keys must be unique; got {self.fitness_keys!r}"
             )
         return self
 
@@ -158,7 +178,7 @@ class FitnessProportionalEliteSelectorConfig(FrozenStrictModel):
     auto-temperature heuristic from the runtime selector."""
 
     kind: Literal["fitness_proportional"] = "fitness_proportional"
-    fitness_key: str = Field(
+    fitness_key: NonBlankStr = Field(
         min_length=1,
         description="Metric key whose value drives the softmax sampling weight.",
     )
@@ -166,9 +186,8 @@ class FitnessProportionalEliteSelectorConfig(FrozenStrictModel):
         default=True,
         description="When true, larger fitness gets larger sampling probability.",
     )
-    temperature: float | None = Field(
+    temperature: FinitePositiveFloat | None = Field(
         default=None,
-        gt=0.0,
         description="Softmax temperature; None enables the runtime's auto-temperature heuristic.",
     )
 
@@ -188,7 +207,7 @@ class WeightedEliteSelectorConfig(FrozenStrictModel):
     """ShinkaEvolve-style sigmoid + child-count weighted sampling."""
 
     kind: Literal["weighted"] = "weighted"
-    fitness_key: str = Field(
+    fitness_key: NonBlankStr = Field(
         min_length=1,
         description="Metric key whose value feeds the sigmoid weighting.",
     )
@@ -196,14 +215,12 @@ class WeightedEliteSelectorConfig(FrozenStrictModel):
         default=True,
         description="When true, larger fitness gets larger sampling probability.",
     )
-    lambda_: float = Field(
+    lambda_: FinitePositiveFloat = Field(
         default=10.0,
-        gt=0.0,
         description="Sigmoid steepness; larger values concentrate sampling on top elites.",
     )
-    epsilon: float = Field(
+    epsilon: FinitePositiveFloat = Field(
         default=1e-8,
-        gt=0.0,
         description="Small constant added to the child-count penalty to avoid division by zero.",
     )
 
@@ -231,7 +248,7 @@ class FitnessArchiveRemoverConfig(FrozenStrictModel):
     its ``max_size``."""
 
     kind: Literal["fitness"] = "fitness"
-    fitness_key: str = Field(
+    fitness_key: NonBlankStr = Field(
         min_length=1,
         description="Metric key whose value picks the eviction victim.",
     )
@@ -259,7 +276,7 @@ class TopFitnessMigrantSelectorConfig(FrozenStrictModel):
     """Picks the top-fitness programs as migrants."""
 
     kind: Literal["top_fitness"] = "top_fitness"
-    fitness_key: str = Field(
+    fitness_key: NonBlankStr = Field(
         min_length=1,
         description="Metric key used to rank candidate migrants.",
     )
@@ -292,7 +309,7 @@ class IslandConfig(FrozenStrictModel):
     so a typo in a fitness key or a wrong selector class name is
     caught at load time."""
 
-    island_id: str = Field(
+    island_id: NonBlankStr = Field(
         min_length=1,
         max_length=100,
         pattern=r"^[a-zA-Z0-9_-]+$",
@@ -303,14 +320,22 @@ class IslandConfig(FrozenStrictModel):
         ge=1,
         description="Archive capacity in entries; when set, archive_remover must also be configured.",
     )
-    behavior_space: BehaviorSpaceConfig
-    archive_selector: ArchiveSelectorConfig
-    elite_selector: EliteSelectorConfig
+    behavior_space: BehaviorSpaceConfig = Field(
+        description="Per-island behavior-space declaration; keys, bounds, resolutions, and binning strategy.",
+    )
+    archive_selector: ArchiveSelectorConfig = Field(
+        description="Policy that ranks programs in the archive; sum-of-fitnesses by default.",
+    )
+    elite_selector: EliteSelectorConfig = Field(
+        description="Policy that samples parents from the archive's elites.",
+    )
     archive_remover: ArchiveRemoverConfig | None = Field(
         default=None,
         description="Policy that picks the eviction victim when max_size is reached.",
     )
-    migrant_selector: MigrantSelectorConfig
+    migrant_selector: MigrantSelectorConfig = Field(
+        description="Policy that selects which programs are exported as migrants to other islands or runs.",
+    )
 
     @model_validator(mode="after")
     def remover_required_when_capped(self) -> IslandConfig:
@@ -347,7 +372,9 @@ class SingleIslandConfig(FrozenStrictModel):
     ``enable_migration=False`` — a single class serves both shapes."""
 
     kind: Literal["single_island"] = "single_island"
-    island: IslandConfig
+    island: IslandConfig = Field(
+        description="The single island that this algorithm variant evolves.",
+    )
 
     def build(
         self, *, program_storage: RedisProgramStorage

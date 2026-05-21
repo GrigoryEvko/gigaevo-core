@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING
 
 from pydantic import Field
 
-from gigaevo.config.schemas._base import FrozenStrictModel
+from gigaevo.config.schemas._base import FinitePositiveFloat, FrozenStrictModel
 
 if TYPE_CHECKING:
     from gigaevo.runner.dag_runner import DagRunnerConfig as RuntimeDagRunnerConfig
@@ -32,7 +32,7 @@ class DAGRunnerConfig(FrozenStrictModel):
     :data:`gigaevo.config.defaults.DEFAULT_DAG_TIMEOUT_S` so direct
     schema construction matches :func:`build_default_runner`."""
 
-    poll_interval: float = Field(
+    poll_interval: FinitePositiveFloat = Field(
         default=5.0,
         ge=0.01,
         le=60.0,
@@ -50,15 +50,14 @@ class DAGRunnerConfig(FrozenStrictModel):
         le=64,
         description="Number of DAG tasks pre-created and parked on the semaphore so a slot can start immediately.",
     )
-    metrics_collection_interval: float = Field(
+    metrics_collection_interval: FinitePositiveFloat = Field(
         default=1.0,
-        gt=0.0,
         description="Seconds between runner-side metric snapshots.",
     )
-    dag_timeout: float = Field(
+    dag_timeout: FinitePositiveFloat = Field(
         default=7200.0,
-        gt=0.0,
-        description="Per-DAG wall-clock timeout in seconds.",
+        le=2_592_000.0,
+        description="Per-DAG wall-clock timeout in seconds (max 30 days).",
     )
 
     def build(self) -> RuntimeDagRunnerConfig:
