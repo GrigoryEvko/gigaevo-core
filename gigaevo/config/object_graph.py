@@ -337,22 +337,20 @@ async def run_with_config(cfg: ExperimentConfig) -> int:
     Sequence:
 
     1. Build the pure object graph.
-    2. Open an ambient :class:`WorkerPool` so stage executors share a
-       single subprocess pool for the lifetime of the run.
-    3. Construct the writer, mutation operator, metrics tracker,
+    2. Construct the writer, mutation operator, metrics tracker,
        program loader, DAG-runner instance and evolution-engine
        instance from the graph.
-    4. Build the :class:`DataPlane` coordinator, mint the per-subspace
+    3. Build the :class:`DataPlane` coordinator, mint the per-subspace
        :class:`EngineRoot`, derive an :class:`ActorIdentity`, and
        attach them to every coordinator-aware object.
-    5. Acquire the instance lock, honour ``redis.resume`` (recover
+    4. Acquire the instance lock, honour ``redis.resume`` (recover
        stranded RUNNING programs and restore engine/strategy state)
        or load the initial population from ``problem.problem_dir``.
-    6. Start both background tasks and block in
+    5. Start both background tasks and block in
        :func:`serve_until_signal` until SIGINT/SIGTERM or natural
        completion.
-    7. Idempotent shutdown in a single ``finally`` block: stop the
-       engine and runner, drain the worker pool, close storage,
+    6. Idempotent shutdown in a single ``finally`` block: stop the
+       engine and runner, shut the loky executor down, close storage,
        shut both DataPlanes down, close the writer.
     """
     from gigaevo.dataplane import (
@@ -366,11 +364,6 @@ async def run_with_config(cfg: ExperimentConfig) -> int:
     )
     from gigaevo.evolution.mutation.mutation_operator import LLMMutationOperator
     from gigaevo.problems.initial_loaders import DirectoryProgramLoader
-    from gigaevo.programs.stages.python_executors.wrapper import (
-        default_exec_runner_pool,
-        reset_ambient_exec_runner_pool,
-        set_ambient_exec_runner_pool,
-    )
     from gigaevo.runner.dag_runner import DagRunner
     from gigaevo.utils.metrics_tracker import MetricsTracker
     from gigaevo.utils.serve import serve_until_signal
@@ -392,9 +385,6 @@ async def run_with_config(cfg: ExperimentConfig) -> int:
     dag_blueprint = graph["dag_blueprint"]
     runtime_runner_config = graph["runtime_runner_config"]
     prompt_fetcher_runtime = evolution_context.prompt_fetcher
-
-    exec_runner_pool = default_exec_runner_pool()
-    pool_token = set_ambient_exec_runner_pool(exec_runner_pool)
 
     writer: CompositeLogger | None = None
     metrics_tracker: MetricsTracker | None = None
@@ -551,25 +541,17 @@ async def run_with_config(cfg: ExperimentConfig) -> int:
         logger.exception("Run failed")
         raise
     finally:
-        # Drain pool workers before unbinding the contextvar so late
-        # exec calls during shutdown still resolve to the shared pool.
-        # Each ``close`` / ``shutdown`` below logs at exception level so
-        # a real backend bug (Redis client double-close, transport stuck
-        # at exit, …) is discoverable, but the next teardown step still
-        # runs — order matters more than success on the shutdown path.
-        try:
-            await exec_runner_pool.shutdown()
-        except Exception:
-            logger.exception("[run] exec_runner_pool.shutdown raised")
-        reset_ambient_exec_runner_pool(pool_token)
-        # Tear the LokyBackend down here too — the python_executors path
-        # uses a separate process pool from the subprocess-script
-        # WorkerPool, and loky's manager thread holds sem_open file
-        # descriptors under /dev/shm that survive the parent unless the
-        # backend's own shutdown sequence runs. atexit catches the
-        # uncaught-exception path, but driving the same call here means
-        # a clean exit reclaims the shared-memory budget before the
-        # next run begins.
+        # Each ``close`` / ``shutdown`` below logs at exception level so a
+        # real backend bug (Redis client double-close, transport stuck at
+        # exit, …) is discoverable, but the next teardown step still runs —
+        # order matters more than success on the shutdown path.
+        #
+        # Tear the LokyBackend down here: loky's manager thread holds
+        # sem_open file descriptors under /dev/shm that survive the parent
+        # unless the backend's own shutdown sequence runs. atexit catches
+        # the uncaught-exception path, but driving the same call here means
+        # a clean exit reclaims the shared-memory budget before the next
+        # run begins.
         from gigaevo.programs.stages.python_executors.wrapper import (
             shutdown_executor,
         )

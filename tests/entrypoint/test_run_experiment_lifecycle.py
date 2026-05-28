@@ -159,27 +159,20 @@ async def test_start_then_exception_still_stops_runner_and_engine():
 
 
 @pytest.mark.asyncio
-async def test_build_object_graph_failure_does_not_leak_pool():
+async def test_build_object_graph_failure_does_not_leak_threads():
     """``build_object_graph`` raising leaves no component reachable; the
-    outer ``finally`` must tolerate every ``X is None`` check, shut the
-    pool down, and reset the ambient pool token."""
-    from gigaevo.programs.stages.python_executors.wrapper import (
-        get_ambient_exec_runner_pool,
-    )
+    outer ``finally`` must tolerate every ``X is None`` check and unwind
+    without leaving daemon threads behind."""
     import gigaevo.config.object_graph as og
 
     boom = RuntimeError("build_object_graph failed mid-tree")
     cfg = _fake_cfg()
 
-    before_ambient = get_ambient_exec_runner_pool()
     threads_before = {t.ident for t in threading.enumerate()}
 
     with patch.object(og, "build_object_graph", side_effect=boom):
         with pytest.raises(RuntimeError, match="build_object_graph failed mid-tree"):
             await og.run_with_config(cfg)
-
-    # Ambient pool was bound for the call and reset in finally.
-    assert get_ambient_exec_runner_pool() is before_ambient
 
     # No extra threads leaked. Allow a small window for daemon threads
     # spawned by unrelated test machinery to settle.

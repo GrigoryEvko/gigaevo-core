@@ -43,7 +43,6 @@ import asyncio
 import atexit
 from collections.abc import Mapping, Sequence
 import contextlib
-import contextvars
 from dataclasses import dataclass, field
 import json
 import mmap
@@ -215,9 +214,9 @@ class WorkerConfig:
 class ExecRunnerError(Exception):
     """User-code failure inside a worker.  ``stderr`` carries the traceback.
 
-    ``stdout_bytes`` is reserved for callers that dispatch via the
-    persistent-worker :class:`WorkerPool` path and want to attach raw
-    captured stdout to the raised error; the loky path leaves it empty.
+    ``stdout_bytes`` is reserved for callers that dispatch via a custom
+    backend and want to attach raw captured stdout to the raised error;
+    the default :class:`LokyBackend` path leaves it empty.
     """
 
     def __init__(
@@ -824,183 +823,3 @@ async def run_exec_runner(
     if backend is None:
         backend = default_loky_backend()
     return await backend.execute(call, deadline_s=timeout)
-
-
-# ---------------------------------------------------------------------------
-# Persistent-worker pool lifecycle.  The experiment driver builds one pool,
-# binds it as the ambient pool, and tears it down at end of run.  The pool
-# itself manages a bounded queue of long-lived ``exec_runner --worker``
-# subprocesses; dispatch through them is the caller's concern.
-# ---------------------------------------------------------------------------
-
-
-async def _kill_process_tree(proc: asyncio.subprocess.Process) -> None:
-    """
-    Best-effort termination of a subprocess and its process group.
-    Safe to call multiple times.
-    """
-    try:
-        os.killpg(os.getpgid(proc.pid), 9)
-    except Exception:
-        try:
-            proc.kill()
-        except Exception:
-            pass
-
-    try:
-        await asyncio.wait_for(proc.wait(), timeout=2.0)
-    except Exception:
-        pass
-
-    for pipe in (proc.stdin, proc.stdout, proc.stderr):
-        if pipe and hasattr(pipe, "close"):
-            try:
-                pipe.close()  # type: ignore[union-attr]
-            except Exception:
-                pass
-
-    # Close the subprocess transport to prevent "Event loop is closed"
-    # warnings from BaseSubprocessTransport.__del__ during GC.
-    transport = getattr(proc, "_transport", None)
-    if transport is not None:
-        try:
-            transport.close()
-        except Exception:
-            pass
-
-
-async def _start_worker_process(
-    script: str,
-    env: dict[str, str],
-    cwd: str | None,
-) -> asyncio.subprocess.Process:
-    """Start exec_runner in persistent worker mode (--worker)."""
-    return await asyncio.create_subprocess_exec(
-        sys.executable,
-        "-u",
-        script,
-        "--worker",
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=cwd,
-        env=env,
-        start_new_session=True,
-    )
-
-
-_MAX_POOL_WORKERS = 32
-
-
-class WorkerPool:
-    """Bounded pool of persistent ``exec_runner --worker`` subprocesses.
-
-    Workers are checked out via :meth:`get_worker`, returned via
-    :meth:`return_worker`, and reclaimed via :meth:`discard_worker` /
-    :meth:`shutdown`.  The pool's ``asyncio.Queue`` and ``asyncio.Lock``
-    bind to the running event loop on first use, so an instance must not
-    survive across distinct ``asyncio.run`` invocations.
-
-    Lifecycle owners (typically the experiment driver) build one pool,
-    bind it via :func:`set_ambient_exec_runner_pool` for the duration of
-    a run, then shut it down before the loop closes.
-    """
-
-    __slots__ = ("max_workers", "_queue", "_count", "_lock")
-
-    def __init__(self, max_workers: int | None = None):
-        if max_workers is None:
-            n = (os.cpu_count() or 4) * 2
-            max_workers = max(1, min(_MAX_POOL_WORKERS, n))
-        self.max_workers = max_workers
-        self._queue: asyncio.Queue[asyncio.subprocess.Process] = asyncio.Queue()
-        self._count = 0
-        self._lock = asyncio.Lock()
-
-    async def get_worker(
-        self,
-        script: str,
-        env: dict[str, str],
-        cwd: str | None,
-    ) -> asyncio.subprocess.Process:
-        """Get an available worker, or create one if under limit, or wait for one to be returned."""
-        async with self._lock:
-            try:
-                proc = self._queue.get_nowait()
-            except asyncio.QueueEmpty:
-                proc = None
-            if proc is None and self._count < self.max_workers:
-                proc = await _start_worker_process(script, env, cwd)
-                self._count += 1
-        if proc is not None:
-            return proc
-        return await self._queue.get()
-
-    async def return_worker(self, proc: asyncio.subprocess.Process) -> None:
-        """Return a healthy worker to the pool; if already dead, decrement count and kill."""
-        if proc.returncode is not None:
-            async with self._lock:
-                self._count -= 1
-            await _kill_process_tree(proc)
-            return
-        self._queue.put_nowait(proc)
-
-    async def discard_worker(self, proc: asyncio.subprocess.Process) -> None:
-        """Remove a dead worker from the pool and kill it."""
-        async with self._lock:
-            self._count -= 1
-        await _kill_process_tree(proc)
-
-    async def shutdown(self) -> None:
-        """Kill all idle workers in the pool.
-
-        Call before the event loop closes to avoid
-        'RuntimeError: Event loop is closed' warnings from
-        subprocess transport ``__del__`` methods.
-        """
-        while not self._queue.empty():
-            try:
-                proc = self._queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-            self._count -= 1
-            await _kill_process_tree(proc)
-
-
-def default_exec_runner_pool() -> WorkerPool:
-    """Build a fresh ``WorkerPool``.
-
-    Each call constructs a new pool. Callers that want to amortize subprocess
-    startup across many ``run_exec_runner`` invocations must hold a reference
-    to a single pool and pass it as ``pool=...``. The pool's ``asyncio.Queue``
-    and ``asyncio.Lock`` bind to the running event loop at first use, so the
-    pool must not be shared across distinct ``asyncio.run()`` invocations.
-    """
-    return WorkerPool()
-
-
-_ambient_pool: contextvars.ContextVar[WorkerPool | None] = contextvars.ContextVar(
-    "gigaevo_exec_runner_pool", default=None
-)
-
-
-def set_ambient_exec_runner_pool(pool: WorkerPool | None) -> contextvars.Token:
-    """Bind ``pool`` as the ambient pool for the current contextvars scope.
-
-    Callers that consult the ambient pool resolve a bound instance via
-    :func:`get_ambient_exec_runner_pool` and fall back to their own
-    construction when ``None`` is returned.  The returned token is
-    required by :func:`reset_ambient_exec_runner_pool` to restore the
-    previous binding.
-    """
-    return _ambient_pool.set(pool)
-
-
-def reset_ambient_exec_runner_pool(token: contextvars.Token) -> None:
-    """Restore the ambient pool to the value held before the matching ``set``."""
-    _ambient_pool.reset(token)
-
-
-def get_ambient_exec_runner_pool() -> WorkerPool | None:
-    """Return the currently bound ambient pool, or ``None`` if unset."""
-    return _ambient_pool.get()
